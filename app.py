@@ -565,16 +565,21 @@ def start_multi_job():
 @app.route("/send_code", methods=["POST"])
 def send_code_route():
     phone = request.json.get("phone")
+    log.info(f"send_code called for {phone}")
     async def _send():
+        log.info("Getting client...")
         c = await get_client()
+        log.info("Client ready, sending code...")
         r = await c.send_code_request(phone)
+        log.info("Code sent successfully")
         return r.phone_code_hash
     try:
-        h = run_in_loop(_send())
+        h = run_in_loop(_send(), timeout=30)
         session["phone"] = phone
         session["hash"]  = h
         return jsonify(ok=True)
     except Exception as e:
+        log.error(f"send_code error: {e}")
         return jsonify(ok=False, error=str(e))
 
 @app.route("/sign_in", methods=["POST"])
