@@ -846,7 +846,7 @@ select[multiple] { height: 140px; }
 
   <div class="card" id="auth-card">
     <h2>🔐 Authentication <span id="session-badge" class="badge red">Checking...</span></h2>
-    <div id="auth-section" class="hidden">
+    <div id="auth-section">
       <input type="tel" id="phone" placeholder="Phone number (+91...)" />
       <button class="btn-primary btn-full" onclick="sendCode()">Send Code</button>
       <div id="code-section" class="hidden">
@@ -959,27 +959,24 @@ async function checkAuth() {
   badge.textContent = 'Checking...';
   badge.className   = 'badge red';
 
+  // Always show login form immediately — never block the UI
+  document.getElementById('auth-section').classList.remove('hidden');
+
   try {
-    // Step 1: instant check — no Telethon involved
     const exists = await api('/session_exists');
 
     if (!exists.exists) {
       badge.textContent = '❌ Not logged in';
       badge.className   = 'badge red';
-      document.getElementById('auth-section').classList.remove('hidden');
-      if (exists.error) {
-        document.getElementById('auth-info').textContent = '⚠️ ' + exists.error;
-        document.getElementById('auth-info').classList.remove('hidden');
-      }
       return;
     }
 
-    // Step 2: connect to Telegram — race with 14s timeout
     badge.textContent = 'Connecting...';
+
     const result = await Promise.race([
       api('/check_auth'),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('timeout')), 14000)
+        setTimeout(() => reject(new Error('timeout')), 10000)
       )
     ]);
 
@@ -993,21 +990,16 @@ async function checkAuth() {
       loadDialogs();
       loadHistory();
     } else {
-      badge.textContent = '❌ Session expired';
+      badge.textContent = '❌ Session expired — please log in';
       badge.className   = 'badge red';
-      document.getElementById('auth-section').classList.remove('hidden');
     }
 
   } catch (e) {
-    badge.textContent = '⚠️ Tap to retry';
+    badge.textContent = '⚠️ Could not connect — please log in';
     badge.className   = 'badge red';
-    badge.style.cursor = 'pointer';
-    badge.onclick = () => checkAuth();
-    document.getElementById('auth-section').classList.remove('hidden');
-    console.warn('checkAuth failed:', e.message);
+    console.warn('checkAuth:', e.message);
   }
 }
-
 async function sendCode() {
   const phone = document.getElementById('phone').value.trim();
   if (!phone) return alert('Enter phone number');
