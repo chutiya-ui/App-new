@@ -214,10 +214,18 @@ def get_dialogs():
         if not await c.is_user_authorized():
             raise Exception("Not authorized")
         dialogs = await c.get_dialogs(limit=200)
-        return [
-            {"id": str(d.id), "name": d.name or "Unknown", "type": type(d.entity).__name__}
-            for d in dialogs if d.name
-        ]
+        result = []
+        for d in dialogs:
+            if not d.name:
+                continue
+            username = getattr(d.entity, 'username', None)
+            identifier = f"@{username}" if username else str(d.id)
+            result.append({
+                "id": identifier,
+                "name": d.name or "Unknown",
+                "type": type(d.entity).__name__
+            })
+        return result
     try:
         return jsonify(dialogs=run_in_loop(_get()))
     except Exception as e:
@@ -268,6 +276,19 @@ def scan_duplicates():
     except Exception as e:
         return jsonify(ok=False, error=str(e))
 
+async def resolve_entity(client, identifier):
+    identifier = str(identifier).strip()
+    if identifier.startswith("@") or identifier.startswith("http") or identifier.startswith("+"):
+        return await client.get_entity(identifier)
+    try:
+        numeric_id = int(identifier)
+        async for dialog in client.iter_dialogs():
+            if dialog.id == numeric_id or dialog.entity.id == numeric_id:
+                return dialog.entity
+        return await client.get_entity(numeric_id)
+    except ValueError:
+        return await client.get_entity(identifier)
+
 def _get_media_type(msg) -> str:
     if isinstance(msg.media, MessageMediaPhoto):
         return "photo"
@@ -315,8 +336,8 @@ async def forward_job_async(job_id: str, cfg: dict):
 
     try:
         c = await get_client()
-        src = await c.get_entity(cfg["source"])
-        dst = await c.get_entity(cfg["dest"])
+        src = await resolve_entity(c, cfg["source"])
+        dst = await resolve_entity(c, cfg["dest"])
         limit = int(cfg.get("limit", 100))
         media_types = cfg.get("media_types", ["video", "photo", "document", "text"])
         skip_dupes = cfg.get("skip_duplicates", True)
