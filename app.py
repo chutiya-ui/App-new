@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 
 API_ID         = int(os.environ.get("API_ID", "0"))
 API_HASH       = os.environ.get("API_HASH", "")
-SECRET_KEY     = os.environ.get("SECRET_KEY", "changeme"))
+SECRET_KEY     = os.environ.get("SECRET_KEY", "changeme")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
 CLIENT_KWARGS = dict(
