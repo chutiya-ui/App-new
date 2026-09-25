@@ -988,26 +988,68 @@ select[multiple] { height: 140px; }
 
 </div>
 <script>
-let currentJobKey    = null;
-let pollInterval     = null;
+let currentJobKey     = null;
+let pollInterval      = null;
 let multiPollInterval = null;
-let currentLiveSrcId = null;
-let activeMultiJobs  = [];
+let currentLiveSrcId  = null;
+let activeMultiJobs   = [];
 
-async function api(url, method='GET', body=null) {
-  const opts = { method, headers: {'Content-Type':'application/json'} };
+async function api(url, method = 'GET', body = null) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(url, opts);
   return r.json();
 }
 
 // ── Auth ───────────────────────────────────────────────────
+async function checkAuth() {
+  const badge = document.getElementById('session-badge');
+  badge.textContent = 'Checking...';
+  badge.className   = 'badge red';
 
+  try {
+    // Fast path — does a session string exist at all?
+    const exists = await api('/session_exists');
+    if (!exists.exists) {
+      // No session saved — show login form immediately
+      badge.textContent = '❌ Not logged in';
+      badge.className   = 'badge red';
+      document.getElementById('auth-section').classList.remove('hidden');
+      return;
+    }
+
+    // Session exists — try to validate it with Telethon
+    badge.textContent = 'Connecting...';
+    const r = await api('/check_auth');
+
+    if (r.authed) {
+      badge.textContent = '✅ Session Active';
+      badge.className   = 'badge green';
+      document.getElementById('auth-section').classList.add('hidden');
+      document.getElementById('auth-info').textContent =
+        '✅ Session restored automatically.';
+      document.getElementById('auth-info').classList.remove('hidden');
+      document.getElementById('forward-card').classList.remove('hidden');
+      loadDialogs();
+      loadHistory();
+    } else {
+      badge.textContent = '❌ Not logged in';
+      badge.className   = 'badge red';
+      document.getElementById('auth-section').classList.remove('hidden');
+    }
+  } catch (e) {
+    // Network error or timeout — don't freeze, just show login
+    badge.textContent = '⚠️ Connection error';
+    badge.className   = 'badge red';
+    document.getElementById('auth-section').classList.remove('hidden');
+    console.error('checkAuth error:', e);
+  }
+}
 
 async function sendCode() {
   const phone = document.getElementById('phone').value.trim();
   if (!phone) return alert('Enter phone number');
-  const r = await api('/send_code', 'POST', {phone});
+  const r = await api('/send_code', 'POST', { phone });
   if (r.ok) {
     document.getElementById('code-section').classList.remove('hidden');
     alert('OTP sent to Telegram');
@@ -1019,15 +1061,16 @@ async function sendCode() {
 async function signIn() {
   const code     = document.getElementById('code').value.trim();
   const password = document.getElementById('twofa').value.trim();
-  const r = await api('/sign_in', 'POST', {code, password});
+  const r = await api('/sign_in', 'POST', { code, password });
   if (r.ok) {
     document.getElementById('session-badge').textContent = '✅ Session Active';
     document.getElementById('session-badge').className   = 'badge green';
     document.getElementById('auth-section').classList.add('hidden');
-    document.getElementById('auth-info').textContent =
-      '✅ Logged in! Session saved.';
+    document.getElementById('auth-info').textContent     =
+      '✅ Logged in! Copy the session string below and paste it into Railway as SESSION_STRING.';
     document.getElementById('auth-info').classList.remove('hidden');
     document.getElementById('forward-card').classList.remove('hidden');
+    console.log('SESSION_STRING:', r.session_string);
     loadDialogs();
     loadHistory();
   } else {
@@ -1039,7 +1082,7 @@ async function signIn() {
 async function loadDialogs() {
   const r = await api('/dialogs');
   if (r.error) {
-    if (r.error.includes('authorized')) {
+    if (r.error.includes('authorized') || r.error.includes('401')) {
       document.getElementById('auth-section').classList.remove('hidden');
       document.getElementById('forward-card').classList.add('hidden');
     } else {
@@ -1055,14 +1098,12 @@ async function loadDialogs() {
     srcSel.add(new Option(`${d.name} (${d.type})`, d.id));
     dstSel.add(new Option(`${d.name} (${d.type})`, d.id));
   });
-
-  // Show selected sources as tags
   srcSel.addEventListener('change', updateSelectedDisplay);
 }
 
 function updateSelectedDisplay() {
-  const sel     = document.getElementById('source-select');
-  const display = document.getElementById('selected-sources-display');
+  const sel      = document.getElementById('source-select');
+  const display  = document.getElementById('selected-sources-display');
   const selected = Array.from(sel.selectedOptions);
   if (selected.length === 0) {
     display.innerHTML =
@@ -1092,9 +1133,7 @@ async function loadHistory() {
   list.innerHTML = r.jobs.map(j => `
     <div class="job-row" onclick="resumeMonitor('${j.job_key}')">
       <div>
-        <div style="font-size:0.88rem;font-weight:600;">
-          ${j.source} → ${j.dest}
-        </div>
+        <div style="font-size:0.88rem;font-weight:600;">${j.source} → ${j.dest}</div>
         <div style="font-size:0.76rem;color:#888;">${j.updated_at}</div>
       </div>
       <div style="text-align:right;">
@@ -1109,8 +1148,7 @@ async function loadHistory() {
 
 function showJobBanner(j) {
   document.getElementById('active-job-banner').classList.remove('hidden');
-  document.getElementById('banner-info').textContent =
-    `${j.source} → ${j.dest}`;
+  document.getElementById('banner-info').textContent = `${j.source} → ${j.dest}`;
 }
 
 function resumeMonitor(job_key) {
@@ -1149,7 +1187,7 @@ async function scanDuplicates() {
   const types  = getMediaTypes().filter(t => t !== 'text');
   if (!source) return alert('Select a source channel');
   const r = await api('/scan_duplicates', 'POST',
-    {source, limit, media_types: types});
+    { source, limit, media_types: types });
   const card    = document.getElementById('dupe-card');
   const summary = document.getElementById('dupe-summary');
   const list    = document.getElementById('dupe-list');
@@ -1159,7 +1197,7 @@ async function scanDuplicates() {
     list.innerHTML = r.duplicates.map(d =>
       `<div class="dupe-item">
         <span>Msg #${d.msg_id} (${d.type})</span>
-        <span>Dup of #${d.duplicate_of} | ${(d.size/1024/1024).toFixed(1)}MB</span>
+        <span>Dup of #${d.duplicate_of} | ${(d.size / 1024 / 1024).toFixed(1)} MB</span>
       </div>`
     ).join('') ||
     '<div style="color:#888;padding:8px;">No duplicates ✅</div>';
@@ -1175,11 +1213,10 @@ async function startJob() {
   const cfg    = getJobConfig();
   if (!source || !cfg.dest) return alert('Select source and destination');
   if (cfg.media_types.length === 0) return alert('Select at least one content type');
-
-  const r = await api('/start_job', 'POST', {...cfg, source});
+  const r = await api('/start_job', 'POST', { ...cfg, source });
   if (r.ok) {
     currentJobKey = r.job_key;
-    showJobBanner({source, dest: cfg.dest});
+    showJobBanner({ source, dest: cfg.dest });
     document.getElementById('dupe-card').classList.add('hidden');
     startPolling();
     loadHistory();
@@ -1193,12 +1230,10 @@ async function startMultiJob() {
   const sel     = document.getElementById('source-select');
   const sources = Array.from(sel.selectedOptions).map(o => o.value);
   const cfg     = getJobConfig();
-
   if (sources.length === 0) return alert('Select at least one source channel');
   if (!cfg.dest) return alert('Select a destination channel');
-  if (sources.length === 1) return startJob();  // fallback to single
-
-  const r = await api('/start_multi_job', 'POST', {...cfg, sources});
+  if (sources.length === 1) return startJob();
+  const r = await api('/start_multi_job', 'POST', { ...cfg, sources });
   if (r.ok) {
     activeMultiJobs = r.jobs.map(j => j.job_key);
     document.getElementById('multi-monitor-card').classList.remove('hidden');
@@ -1217,21 +1252,17 @@ function startPolling() {
     if (!currentJobKey) return;
     const j = await api(`/job_status/${currentJobKey}`);
     if (j.error) return;
-
     document.getElementById('stat-done').textContent    = j.done    || 0;
     document.getElementById('stat-skipped').textContent = j.skipped || 0;
     document.getElementById('stat-dupes').textContent   = j.dupes   || 0;
     document.getElementById('stat-errors').textContent  = j.errors  || 0;
-
     const badge = document.getElementById('banner-status');
     badge.textContent = j.status;
     badge.className   = `status ${j.status}`;
-
     const lb     = document.getElementById('log-box');
     lb.innerHTML = (j.logs || []).join('\n');
     lb.scrollTop = lb.scrollHeight;
-
-    if (['done','error','cancelled'].includes(j.status)) {
+    if (['done', 'error', 'cancelled'].includes(j.status)) {
       clearInterval(pollInterval);
       loadHistory();
     }
@@ -1263,15 +1294,12 @@ function startMultiPolling() {
         </div>
         <div style="margin-top:6px;">
           <button class="btn-danger btn-sm"
-            onclick="cancelSpecific('${activeMultiJobs[i]}')">
-            ⏹ Cancel
-          </button>
+            onclick="cancelSpecific('${activeMultiJobs[i]}')">⏹ Cancel</button>
         </div>
       </div>
     `).join('');
-
     const allDone = statuses.every(j =>
-      ['done','error','cancelled'].includes(j.status)
+      ['done', 'error', 'cancelled'].includes(j.status)
     );
     if (allDone) {
       clearInterval(multiPollInterval);
@@ -1305,7 +1333,8 @@ async function startLive() {
   const dest   = document.getElementById('dest-select').value;
   const types  = getMediaTypes();
   if (!source || !dest) return alert('Select source and destination first');
-  const r = await api('/start_live', 'POST', {source, dest, media_types: types});
+  const r = await api('/start_live', 'POST',
+    { source, dest, media_types: types });
   if (r.ok) {
     currentLiveSrcId = r.src_id;
     document.getElementById('live-status-box').innerHTML =
@@ -1317,13 +1346,14 @@ async function startLive() {
 
 async function stopLive() {
   if (!currentLiveSrcId) return alert('No active live sync');
-  const r = await api('/stop_live', 'POST', {src_id: currentLiveSrcId});
+  const r = await api('/stop_live', 'POST', { src_id: currentLiveSrcId });
   if (r.ok) {
     currentLiveSrcId = null;
     document.getElementById('live-status-box').textContent = '⏹ Stopped.';
   }
 }
 
+// ── Boot ───────────────────────────────────────────────────
 checkAuth();
 </script>
 </body>
