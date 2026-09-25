@@ -1,6 +1,5 @@
 import os, asyncio, threading, hashlib, logging, io, urllib.request, json
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, session, render_template_string
 from telethon import TelegramClient, events
 from telethon.tl.types import (
@@ -32,13 +31,11 @@ CLIENT_KWARGS = dict(
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 
-DB_PATH       = "/tmp/forwarder.db"
-_loop         = asyncio.new_event_loop()
-_client       = None
-_live_handlers  = {}
-_running_jobs   = {}
-
-# How many messages to download/upload in parallel per job
+DB_PATH          = "/tmp/forwarder.db"
+_loop            = asyncio.new_event_loop()
+_client          = None
+_live_handlers   = {}
+_running_jobs    = {}
 PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "4"))
 
 # ── Database ───────────────────────────────────────────────
@@ -106,38 +103,46 @@ def self_ping():
             log.warning(f"Self-ping failed: {e}")
         threading.Event().wait(240)
 
+threading.Thread(target=self_ping, daemon=True).start()
+
 @app.route("/ping")
 def ping():
     return jsonify(status="alive", time=str(datetime.now()))
 
-threading.Thread(target=self_ping, daemon=True).start()
-
-@app.route("/session_exists")
-def session_exists():
-    ss = get_best_session()
-    if not ss:
-        return jsonify(exists=False)
-    # Also do a quick API_ID sanity check so we don't try to connect with empty creds
-    if not API_ID or not API_HASH:
-        return jsonify(exists=False, error="API_ID or API_HASH missing")
-    return jsonify(exists=True)
-
 # ── Session helpers ────────────────────────────────────────
 def save_session_to_db(ss: str):
-    with db() as c:
-        c.execute("DELETE FROM sessions")
-        c.execute("INSERT INTO sessions (session_str) VALUES (?)", (ss,))
-        c.commit()
+    try:
+        with db() as c:
+            c.execute("DELETE FROM sessions")
+            c.execute("INSERT INTO sessions (session_str) VALUES (?)", (ss,))
+            c.commit()
+    except Exception as e:
+        log.warning(f"save_session_to_db failed: {e}")
 
 def load_session_from_db() -> str:
-    with db() as c:
-        row = c.execute(
-            "SELECT session_str FROM sessions ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-    return row["session_str"] if row else ""
+    try:
+        with db() as c:
+            row = c.execute(
+                "SELECT session_str FROM sessions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return row["session_str"] if row else ""
+    except Exception:
+        return ""
 
 def get_best_session() -> str:
     return SESSION_STRING or load_session_from_db()
+
+# ── Instant routes — no Telethon, no async ────────────────
+@app.route("/ping")
+def ping():
+    return jsonify(status="alive", time=str(datetime.now()))
+
+@app.route("/session_exists")
+def session_exists():
+    if not API_ID or API_ID == 0 or not API_HASH:
+        return jsonify(exists=False, error="API_ID or API_HASH missing in Railway variables")
+    ss = get_best_session()
+    return jsonify(exists=bool(ss))
 
 # ── Job DB helpers ─────────────────────────────────────────
 def job_key_for(source: str, dest: str) -> str:
@@ -234,7 +239,7 @@ def record_hash(file_hash: str, msg_id: int, source: str):
         c.commit()
 
 # ── Telethon loop ──────────────────────────────────────────
-def run_in_loop(coro, timeout=60):
+def run_in_loop(coro, timeout=30):
     return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=timeout)
 
 def start_loop():
@@ -275,8 +280,8 @@ async def get_client() -> TelegramClient:
 async def resolve_entity(client, identifier):
     identifier = str(identifier).strip()
     if (identifier.startswith("@") or
-        identifier.startswith("http") or
-        identifier.startswith("+")):
+            identifier.startswith("http") or
+            identifier.startswith("+")):
         return await client.get_entity(identifier)
     try:
         numeric_id = int(identifier)
@@ -311,8 +316,7 @@ async def reupload_with_metadata(client, msg, dst, caption, raw=None):
     if msg.document:
         orig_attrs = list(msg.document.attributes or [])
         if msg.document.thumbs:
-            num_thumbs = len(msg.document.thumbs)
-            for thumb_idx in range(num_thumbs - 1, -1, -1):
+            for thumb_idx in range(len(msg.document.thumbs) - 1, -1, -1):
                 try:
                     thumb_bytes = await client.download_media(
                         msg.document, file=bytes, thumb=thumb_idx
@@ -347,13 +351,11 @@ async def reupload_with_metadata(client, msg, dst, caption, raw=None):
     )
 
 # ── Core: process one message ──────────────────────────────
+def compute_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
 async def process_message(client, msg, src, dst, job_key,
                            media_types, skip_dupes, counters, lock):
-    """
-    Download, deduplicate, and forward a single message.
-    Designed to run concurrently via asyncio.gather.
-    counters dict is shared and protected by asyncio.Lock.
-    """
     mtype = _get_media_type(msg) if msg.media else "text"
 
     if mtype not in media_types:
@@ -369,8 +371,6 @@ async def process_message(client, msg, src, dst, job_key,
 
         if msg.media:
             forwarded_directly = False
-
-            # Try direct forward first — fastest path
             try:
                 await client.forward_messages(dst, msg.id, src)
                 forwarded_directly = True
@@ -379,9 +379,7 @@ async def process_message(client, msg, src, dst, job_key,
                 pass
 
             if not forwarded_directly:
-                # Download once for both hash check and upload
                 raw = await client.download_media(msg, file=bytes)
-
                 if raw and skip_dupes and mtype in ["video", "photo", "document"]:
                     file_hash = compute_hash(raw)
                     if hash_already_seen(file_hash):
@@ -392,10 +390,8 @@ async def process_message(client, msg, src, dst, job_key,
                         return
                     else:
                         record_hash(file_hash, msg.id, str(src.id))
-
                 await reupload_with_metadata(client, msg, dst, caption, raw=raw)
                 db_log(job_key, f"✅ Re-uploaded {msg.id} ({mtype})")
-
         else:
             if "text" in media_types and msg.text:
                 await client.send_message(dst, msg.text)
@@ -410,10 +406,7 @@ async def process_message(client, msg, src, dst, job_key,
             counters["errors"] += 1
         db_log(job_key, f"❌ Error {msg.id}: {ex}")
 
-def compute_hash(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-# ── Forward job with parallel workers ─────────────────────
+# ── Forward job ────────────────────────────────────────────
 async def forward_job_async(job_key: str, cfg: dict):
     try:
         c           = await get_client()
@@ -426,8 +419,8 @@ async def forward_job_async(job_key: str, cfg: dict):
         pin_every   = int(cfg.get("pin_every", 200))
         workers     = int(cfg.get("workers", PARALLEL_WORKERS))
 
-        job          = db_get_job(job_key)
-        counters     = {
+        job      = db_get_job(job_key)
+        counters = {
             "done":    job["done"],
             "skipped": job["skipped"],
             "dupes":   job["dupes"],
@@ -442,7 +435,6 @@ async def forward_job_async(job_key: str, cfg: dict):
                f"{action} | {cfg['source']} → {cfg['dest']} | "
                f"workers={workers} | types={media_types}")
 
-        # Collect all pending messages first
         pending = []
         async for msg in c.iter_messages(src, limit=limit):
             job = db_get_job(job_key)
@@ -452,19 +444,15 @@ async def forward_job_async(job_key: str, cfg: dict):
             if not already_forwarded(job_key, msg.id):
                 pending.append(msg)
 
-        db_log(job_key, f"📋 {len(pending)} messages to process "
-                        f"({limit - len(pending)} already done)")
+        db_log(job_key, f"📋 {len(pending)} messages to process")
 
-        # Process in parallel batches of `workers` size
         for i in range(0, len(pending), workers):
             job = db_get_job(job_key)
             if job["status"] == "cancelled":
                 db_log(job_key, "Cancelled mid-batch")
                 break
 
-            batch = pending[i : i + workers]
-
-            # Run batch concurrently
+            batch = pending[i: i + workers]
             await asyncio.gather(*[
                 process_message(
                     c, msg, src, dst, job_key,
@@ -473,7 +461,6 @@ async def forward_job_async(job_key: str, cfg: dict):
                 for msg in batch
             ])
 
-            # Persist counters after each batch
             db_update_job(
                 job_key,
                 done=counters["done"],
@@ -482,10 +469,8 @@ async def forward_job_async(job_key: str, cfg: dict):
                 errors=counters["errors"]
             )
 
-            # Auto-pin after each batch
             if pin_first and not first_pinned and counters["done"] > 0:
                 try:
-                    # Get last sent message to pin
                     async for last_msg in c.iter_messages(dst, limit=1):
                         await c.pin_message(dst, last_msg.id, notify=False)
                         first_pinned = True
@@ -505,10 +490,9 @@ async def forward_job_async(job_key: str, cfg: dict):
                     pass
 
             db_log(job_key,
-                   f"📦 Batch {i//workers + 1} done — "
-                   f"Total: ✅{counters['done']} ⚠️{counters['dupes']} ❌{counters['errors']}")
+                   f"📦 Batch {i // workers + 1} done — "
+                   f"✅{counters['done']} ⚠️{counters['dupes']} ❌{counters['errors']}")
 
-            # Small delay between batches to avoid flood
             await asyncio.sleep(0.5)
 
         job = db_get_job(job_key)
@@ -532,51 +516,17 @@ async def forward_job_async(job_key: str, cfg: dict):
     finally:
         _running_jobs.pop(job_key, None)
 
-# ── Multi-source job launcher ──────────────────────────────
-@app.route("/start_multi_job", methods=["POST"])
-def start_multi_job():
-    """
-    Start multiple source → same dest jobs simultaneously.
-    Body: { sources: ["@ch1","@ch2"], dest: "@dest", ...same options }
-    """
-    data    = request.json
-    sources = data.get("sources", [])
-    dest    = data.get("dest", "")
-    if not sources or not dest:
-        return jsonify(ok=False, error="sources and dest required")
-
-    launched = []
-    for source in sources:
-        cfg     = {**data, "source": source}
-        job_key = job_key_for(source, dest)
-        if job_key in _running_jobs:
-            launched.append({"job_key": job_key, "source": source, "resumed": True})
-            continue
-        db_create_or_resume_job(job_key, source, dest, cfg)
-
-        def _run(jk=job_key, c=cfg):
-            _running_jobs[jk] = True
-            asyncio.run_coroutine_threadsafe(
-                forward_job_async(jk, c), _loop
-            )
-
-        threading.Thread(target=_run, daemon=True).start()
-        launched.append({"job_key": job_key, "source": source, "resumed": False})
-
-    return jsonify(ok=True, jobs=launched)
-
 # ── Auth routes ────────────────────────────────────────────
 @app.route("/send_code", methods=["POST"])
 def send_code_route():
     phone = request.json.get("phone")
     log.info(f"send_code called for {phone}")
+
     async def _send():
-        log.info("Getting client...")
         c = await get_client()
-        log.info("Client ready, sending code...")
         r = await c.send_code_request(phone)
-        log.info("Code sent successfully")
         return r.phone_code_hash
+
     try:
         h = run_in_loop(_send(), timeout=30)
         session["phone"] = phone
@@ -590,6 +540,7 @@ def send_code_route():
 def sign_in_route():
     code = request.json.get("code")
     pw   = request.json.get("password", "")
+
     async def _sign():
         c = await get_client()
         try:
@@ -606,6 +557,7 @@ def sign_in_route():
         ss = c.session.save()
         save_session_to_db(ss)
         return ss
+
     try:
         ss = run_in_loop(_sign())
         session["auth"] = True
@@ -618,8 +570,9 @@ def check_auth():
     async def _check():
         c = await get_client()
         return await c.is_user_authorized()
+
     try:
-        ok = run_in_loop(_check(),timeout=15)
+        ok = run_in_loop(_check(), timeout=15)
         if ok:
             session["auth"] = True
         return jsonify(authed=ok)
@@ -647,13 +600,14 @@ def get_dialogs():
                 "type": type(d.entity).__name__
             })
         return result
+
     try:
-        return jsonify(dialogs=run_in_loop(_get()))
+        return jsonify(dialogs=run_in_loop(_get(), timeout=30))
     except Exception as e:
         log.error(f"Dialogs error: {e}")
         return jsonify(error=str(e)), 401
 
-# ── Single job routes ──────────────────────────────────────
+# ── Job routes ─────────────────────────────────────────────
 @app.route("/start_job", methods=["POST"])
 def start_job():
     data    = request.json
@@ -674,6 +628,34 @@ def start_job():
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify(ok=True, job_key=job_key)
+
+@app.route("/start_multi_job", methods=["POST"])
+def start_multi_job():
+    data    = request.json
+    sources = data.get("sources", [])
+    dest    = data.get("dest", "")
+    if not sources or not dest:
+        return jsonify(ok=False, error="sources and dest required")
+
+    launched = []
+    for source in sources:
+        cfg     = {**data, "source": source}
+        job_key = job_key_for(source, dest)
+        if job_key in _running_jobs:
+            launched.append({"job_key": job_key, "source": source, "resumed": True})
+            continue
+        db_create_or_resume_job(job_key, source, dest, cfg)
+
+        def _run(jk=job_key, c=cfg):
+            _running_jobs[jk] = True
+            asyncio.run_coroutine_threadsafe(
+                forward_job_async(jk, c), _loop
+            )
+
+        threading.Thread(target=_run, daemon=True).start()
+        launched.append({"job_key": job_key, "source": source, "resumed": False})
+
+    return jsonify(ok=True, jobs=launched)
 
 @app.route("/job_status/<job_key>")
 def job_status(job_key):
@@ -703,12 +685,12 @@ def start_live():
     data        = request.json
     source      = data.get("source")
     dest        = data.get("dest")
-    media_types = data.get("media_types", ["video","photo","document","text"])
+    media_types = data.get("media_types", ["video", "photo", "document", "text"])
 
     async def _start():
-        c   = await get_client()
-        src = await resolve_entity(c, source)
-        dst = await resolve_entity(c, dest)
+        c      = await get_client()
+        src    = await resolve_entity(c, source)
+        dst    = await resolve_entity(c, dest)
         src_id = src.id
 
         if src_id in _live_handlers:
@@ -726,9 +708,7 @@ def start_live():
                     try:
                         await c.forward_messages(dst, msg.id, src)
                     except Exception:
-                        await reupload_with_metadata(
-                            c, msg, dst, msg.text or ""
-                        )
+                        await reupload_with_metadata(c, msg, dst, msg.text or "")
                 elif "text" in media_types and msg.text:
                     await c.send_message(dst, msg.text)
             except Exception as ex:
@@ -746,6 +726,7 @@ def start_live():
 @app.route("/stop_live", methods=["POST"])
 def stop_live():
     src_id = int(request.json.get("src_id", 0))
+
     async def _stop():
         c = await get_client()
         if src_id in _live_handlers:
@@ -753,6 +734,7 @@ def stop_live():
             del _live_handlers[src_id]
             return True
         return False
+
     try:
         return jsonify(ok=run_in_loop(_stop()))
     except Exception as e:
@@ -767,7 +749,7 @@ def live_status():
 def scan_duplicates():
     data        = request.json
     source      = data.get("source")
-    media_types = data.get("media_types", ["video","photo","document"])
+    media_types = data.get("media_types", ["video", "photo", "document"])
     limit       = int(data.get("limit", 100))
 
     async def _scan():
@@ -782,7 +764,7 @@ def scan_duplicates():
             if mtype not in media_types:
                 continue
             try:
-                raw = await c.download_media(msg, file=bytes)
+                raw = await client.download_media(msg, file=bytes)
                 if not raw:
                     continue
                 fh = compute_hash(raw)
@@ -801,7 +783,7 @@ def scan_duplicates():
         return dupes
 
     try:
-        dupes = run_in_loop(_scan())
+        dupes = run_in_loop(_scan(), timeout=120)
         return jsonify(ok=True, duplicates=dupes, count=len(dupes))
     except Exception as e:
         return jsonify(ok=False, error=str(e))
@@ -866,10 +848,9 @@ select[multiple] { height: 140px; }
 <div class="container">
   <h1>🚀 TG Forwarder Pro</h1>
 
-  <!-- Auth -->
   <div class="card" id="auth-card">
     <h2>🔐 Authentication <span id="session-badge" class="badge red">Checking...</span></h2>
-    <div id="auth-section">
+    <div id="auth-section" class="hidden">
       <input type="tel" id="phone" placeholder="Phone number (+91...)" />
       <button class="btn-primary btn-full" onclick="sendCode()">Send Code</button>
       <div id="code-section" class="hidden">
@@ -882,31 +863,21 @@ select[multiple] { height: 140px; }
          style="color:#27ae60;font-size:0.9rem;margin-top:8px;"></div>
   </div>
 
-  <!-- Config -->
   <div class="card hidden" id="forward-card">
     <h2>⚙️ Forward Configuration</h2>
-
     <label style="font-size:0.85rem;color:#aaa;display:block;margin-bottom:4px;">
-      Source Channel(s) <small style="color:#666;">(hold Ctrl/Cmd to select multiple)</small>
+      Source Channel(s) <small style="color:#666;">(hold Ctrl/Cmd for multiple)</small>
     </label>
     <select id="source-select" multiple><option value="">Loading...</option></select>
-
     <div class="multi-source-list" id="selected-sources-display">
-      <span style="color:#555;font-size:0.82rem;">Selected sources will appear here</span>
+      <span style="color:#555;font-size:0.82rem;">Selected sources appear here</span>
     </div>
-
     <label style="font-size:0.85rem;color:#aaa;display:block;margin-bottom:4px;">Destination Channel</label>
     <select id="dest-select"><option value="">Loading...</option></select>
-
     <label style="font-size:0.85rem;color:#aaa;display:block;margin-bottom:4px;">Message Limit (per source)</label>
     <input type="number" id="limit" value="100" min="1" max="10000" />
-
-    <label style="font-size:0.85rem;color:#aaa;display:block;margin-bottom:4px;">
-      Parallel Workers
-      <small style="color:#666;">(how many messages download simultaneously, 1–8)</small>
-    </label>
+    <label style="font-size:0.85rem;color:#aaa;display:block;margin-bottom:4px;">Parallel Workers (1–8)</label>
     <input type="number" id="workers" value="4" min="1" max="8" />
-
     <label style="font-size:0.85rem;color:#aaa;display:block;margin-bottom:8px;">Content Types:</label>
     <div class="checkbox-group">
       <label><input type="checkbox" id="type-video"    checked> 🎥 Videos</label>
@@ -918,25 +889,18 @@ select[multiple] { height: 140px; }
       <label><input type="checkbox" id="skip-dupes" checked> 🔍 Skip duplicates</label>
       <label><input type="checkbox" id="pin-first"  checked> 📌 Pin first message</label>
     </div>
-    <input type="number" id="pin-every" value="200" min="1"
-           placeholder="Pin every N messages" />
-    <small style="color:#888;display:block;margin-bottom:14px;">
-      Auto-pin every N forwarded messages
-    </small>
-
+    <input type="number" id="pin-every" value="200" min="1" placeholder="Pin every N messages" />
+    <small style="color:#888;display:block;margin-bottom:14px;">Auto-pin every N forwarded messages</small>
     <div class="btn-group">
       <button class="btn-warn btn-sm"    onclick="scanDuplicates()">🔍 Scan Dupes</button>
       <button class="btn-primary btn-sm" onclick="startJob()">▶️ Start</button>
-      <button class="btn-green btn-sm"   onclick="startMultiJob()">⚡ Multi-Source Start</button>
+      <button class="btn-green btn-sm"   onclick="startMultiJob()">⚡ Multi-Source</button>
       <button class="btn-live btn-sm"    onclick="showLive()">🔴 Live Sync</button>
     </div>
   </div>
 
-  <!-- Active job banner -->
   <div class="card hidden" id="active-job-banner" style="border-color:#27ae60;">
-    <h2>⚡ Active Job
-      <span id="banner-status" class="status running">running</span>
-    </h2>
+    <h2>⚡ Active Job <span id="banner-status" class="status running">running</span></h2>
     <div style="font-size:0.85rem;color:#aaa;margin-bottom:10px;" id="banner-info"></div>
     <div class="stats">
       <div class="stat"><div class="num" id="stat-done">0</div><div class="lbl">Forwarded</div></div>
@@ -950,13 +914,11 @@ select[multiple] { height: 140px; }
     </div>
   </div>
 
-  <!-- Multi-job monitor -->
   <div class="card hidden" id="multi-monitor-card">
     <h2>⚡ Multi-Source Jobs</h2>
     <div id="multi-job-list"></div>
   </div>
 
-  <!-- Duplicate Report -->
   <div class="card hidden" id="dupe-card">
     <h2>⚠️ Duplicate Report</h2>
     <div id="dupe-summary" style="margin-bottom:10px;font-size:0.9rem;"></div>
@@ -966,31 +928,22 @@ select[multiple] { height: 140px; }
     </button>
   </div>
 
-  <!-- Job History -->
   <div class="card hidden" id="history-card">
-    <h2>📋 Job History
-      <small style="color:#888;font-size:0.8rem;">(click to monitor)</small>
-    </h2>
+    <h2>📋 Job History <small style="color:#888;font-size:0.8rem;">(click to monitor)</small></h2>
     <div id="history-list"></div>
   </div>
 
-  <!-- Live Sync -->
   <div class="card hidden" id="live-card">
     <h2>🔴 Live Sync Mode</h2>
     <p style="font-size:0.85rem;color:#aaa;margin-bottom:14px;">
       Forwards every new message instantly as it arrives.
     </p>
-    <div id="live-status-box"
-         style="margin-bottom:12px;font-size:0.9rem;color:#27ae60;"></div>
-    <button class="btn-live btn-full" style="margin-bottom:8px;" onclick="startLive()">
-      🔴 Start Live Sync
-    </button>
-    <button class="btn-full" style="background:#7f8c8d;color:#fff;" onclick="stopLive()">
-      ⏹ Stop Live Sync
-    </button>
+    <div id="live-status-box" style="margin-bottom:12px;font-size:0.9rem;color:#27ae60;"></div>
+    <button class="btn-live btn-full" style="margin-bottom:8px;" onclick="startLive()">🔴 Start Live Sync</button>
+    <button class="btn-full" style="background:#7f8c8d;color:#fff;" onclick="stopLive()">⏹ Stop Live Sync</button>
   </div>
-
 </div>
+
 <script>
 let currentJobKey     = null;
 let pollInterval      = null;
@@ -1005,29 +958,32 @@ async function api(url, method = 'GET', body = null) {
   return r.json();
 }
 
-// ── Auth ───────────────────────────────────────────────────
 async function checkAuth() {
   const badge = document.getElementById('session-badge');
   badge.textContent = 'Checking...';
   badge.className   = 'badge red';
 
   try {
+    // Step 1: instant check — no Telethon involved
     const exists = await api('/session_exists');
 
     if (!exists.exists) {
       badge.textContent = '❌ Not logged in';
       badge.className   = 'badge red';
       document.getElementById('auth-section').classList.remove('hidden');
+      if (exists.error) {
+        document.getElementById('auth-info').textContent = '⚠️ ' + exists.error;
+        document.getElementById('auth-info').classList.remove('hidden');
+      }
       return;
     }
 
+    // Step 2: connect to Telegram — race with 14s timeout
     badge.textContent = 'Connecting...';
-
-    // Race between the real check and a 12-second timeout
     const result = await Promise.race([
       api('/check_auth'),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('timeout')), 12000)
+        setTimeout(() => reject(new Error('timeout')), 14000)
       )
     ]);
 
@@ -1035,25 +991,24 @@ async function checkAuth() {
       badge.textContent = '✅ Session Active';
       badge.className   = 'badge green';
       document.getElementById('auth-section').classList.add('hidden');
-      document.getElementById('auth-info').textContent = '✅ Session restored.';
+      document.getElementById('auth-info').textContent = '✅ Session restored automatically.';
       document.getElementById('auth-info').classList.remove('hidden');
       document.getElementById('forward-card').classList.remove('hidden');
       loadDialogs();
       loadHistory();
     } else {
-      badge.textContent = '❌ Not logged in';
+      badge.textContent = '❌ Session expired';
       badge.className   = 'badge red';
       document.getElementById('auth-section').classList.remove('hidden');
     }
 
   } catch (e) {
-    // Timeout or network error — show login form, never freeze
     badge.textContent = '⚠️ Tap to retry';
     badge.className   = 'badge red';
     badge.style.cursor = 'pointer';
     badge.onclick = () => checkAuth();
     document.getElementById('auth-section').classList.remove('hidden');
-    console.warn('checkAuth:', e.message);
+    console.warn('checkAuth failed:', e.message);
   }
 }
 
@@ -1077,8 +1032,8 @@ async function signIn() {
     document.getElementById('session-badge').textContent = '✅ Session Active';
     document.getElementById('session-badge').className   = 'badge green';
     document.getElementById('auth-section').classList.add('hidden');
-    document.getElementById('auth-info').textContent     =
-      '✅ Logged in! Copy the session string below and paste it into Railway as SESSION_STRING.';
+    document.getElementById('auth-info').textContent =
+      '✅ Logged in! Copy session string from browser console (F12) and save to Railway as SESSION_STRING.';
     document.getElementById('auth-info').classList.remove('hidden');
     document.getElementById('forward-card').classList.remove('hidden');
     console.log('SESSION_STRING:', r.session_string);
@@ -1089,7 +1044,6 @@ async function signIn() {
   }
 }
 
-// ── Dialogs ────────────────────────────────────────────────
 async function loadDialogs() {
   const r = await api('/dialogs');
   if (r.error) {
@@ -1117,8 +1071,7 @@ function updateSelectedDisplay() {
   const display  = document.getElementById('selected-sources-display');
   const selected = Array.from(sel.selectedOptions);
   if (selected.length === 0) {
-    display.innerHTML =
-      '<span style="color:#555;font-size:0.82rem;">Selected sources appear here</span>';
+    display.innerHTML = '<span style="color:#555;font-size:0.82rem;">Selected sources appear here</span>';
     return;
   }
   display.innerHTML = selected.map(o =>
@@ -1126,18 +1079,15 @@ function updateSelectedDisplay() {
   ).join('');
 }
 
-// ── History ────────────────────────────────────────────────
 async function loadHistory() {
   const r = await api('/all_jobs');
   if (!r.jobs || r.jobs.length === 0) return;
-
   const running = r.jobs.find(j => j.status === 'running');
   if (running && !currentJobKey) {
     currentJobKey = running.job_key;
     showJobBanner(running);
     startPolling();
   }
-
   const card = document.getElementById('history-card');
   const list = document.getElementById('history-list');
   card.classList.remove('hidden');
@@ -1168,7 +1118,6 @@ function resumeMonitor(job_key) {
   startPolling();
 }
 
-// ── Media types ────────────────────────────────────────────
 function getMediaTypes() {
   const t = [];
   if (document.getElementById('type-video').checked)    t.push('video');
@@ -1190,15 +1139,13 @@ function getJobConfig() {
   };
 }
 
-// ── Scan duplicates ────────────────────────────────────────
 async function scanDuplicates() {
   const sel    = document.getElementById('source-select');
   const source = sel.selectedOptions[0]?.value;
   const limit  = document.getElementById('limit').value;
   const types  = getMediaTypes().filter(t => t !== 'text');
   if (!source) return alert('Select a source channel');
-  const r = await api('/scan_duplicates', 'POST',
-    { source, limit, media_types: types });
+  const r = await api('/scan_duplicates', 'POST', { source, limit, media_types: types });
   const card    = document.getElementById('dupe-card');
   const summary = document.getElementById('dupe-summary');
   const list    = document.getElementById('dupe-list');
@@ -1208,16 +1155,14 @@ async function scanDuplicates() {
     list.innerHTML = r.duplicates.map(d =>
       `<div class="dupe-item">
         <span>Msg #${d.msg_id} (${d.type})</span>
-        <span>Dup of #${d.duplicate_of} | ${(d.size / 1024 / 1024).toFixed(1)} MB</span>
+        <span>Dup of #${d.duplicate_of} | ${(d.size/1024/1024).toFixed(1)} MB</span>
       </div>`
-    ).join('') ||
-    '<div style="color:#888;padding:8px;">No duplicates ✅</div>';
+    ).join('') || '<div style="color:#888;padding:8px;">No duplicates ✅</div>';
   } else {
     summary.textContent = 'Scan failed: ' + r.error;
   }
 }
 
-// ── Single source start ────────────────────────────────────
 async function startJob() {
   const sel    = document.getElementById('source-select');
   const source = sel.selectedOptions[0]?.value;
@@ -1236,7 +1181,6 @@ async function startJob() {
   }
 }
 
-// ── Multi-source start ─────────────────────────────────────
 async function startMultiJob() {
   const sel     = document.getElementById('source-select');
   const sources = Array.from(sel.selectedOptions).map(o => o.value);
@@ -1256,7 +1200,6 @@ async function startMultiJob() {
   }
 }
 
-// ── Single poll ────────────────────────────────────────────
 function startPolling() {
   if (pollInterval) clearInterval(pollInterval);
   pollInterval = setInterval(async () => {
@@ -1270,7 +1213,7 @@ function startPolling() {
     const badge = document.getElementById('banner-status');
     badge.textContent = j.status;
     badge.className   = `status ${j.status}`;
-    const lb     = document.getElementById('log-box');
+    const lb = document.getElementById('log-box');
     lb.innerHTML = (j.logs || []).join('\n');
     lb.scrollTop = lb.scrollHeight;
     if (['done', 'error', 'cancelled'].includes(j.status)) {
@@ -1280,17 +1223,11 @@ function startPolling() {
   }, 2000);
 }
 
-// ── Multi poll ─────────────────────────────────────────────
 function startMultiPolling() {
   if (multiPollInterval) clearInterval(multiPollInterval);
   multiPollInterval = setInterval(async () => {
-    if (activeMultiJobs.length === 0) {
-      clearInterval(multiPollInterval);
-      return;
-    }
-    const statuses = await Promise.all(
-      activeMultiJobs.map(k => api(`/job_status/${k}`))
-    );
+    if (activeMultiJobs.length === 0) { clearInterval(multiPollInterval); return; }
+    const statuses = await Promise.all(activeMultiJobs.map(k => api(`/job_status/${k}`)));
     const container = document.getElementById('multi-job-list');
     container.innerHTML = statuses.map((j, i) => `
       <div style="padding:10px;border-bottom:1px solid #2a2a4a;">
@@ -1299,23 +1236,15 @@ function startMultiPolling() {
           <span class="status ${j.status}">${j.status}</span>
         </div>
         <div style="font-size:0.78rem;color:#aaa;margin-top:4px;">
-          ✅ ${j.done||0} forwarded &nbsp;
-          🔁 ${j.dupes||0} dupes &nbsp;
-          ❌ ${j.errors||0} errors
+          ✅ ${j.done||0} forwarded &nbsp; 🔁 ${j.dupes||0} dupes &nbsp; ❌ ${j.errors||0} errors
         </div>
         <div style="margin-top:6px;">
-          <button class="btn-danger btn-sm"
-            onclick="cancelSpecific('${activeMultiJobs[i]}')">⏹ Cancel</button>
+          <button class="btn-danger btn-sm" onclick="cancelSpecific('${activeMultiJobs[i]}')">⏹ Cancel</button>
         </div>
       </div>
     `).join('');
-    const allDone = statuses.every(j =>
-      ['done', 'error', 'cancelled'].includes(j.status)
-    );
-    if (allDone) {
-      clearInterval(multiPollInterval);
-      loadHistory();
-    }
+    const allDone = statuses.every(j => ['done','error','cancelled'].includes(j.status));
+    if (allDone) { clearInterval(multiPollInterval); loadHistory(); }
   }, 2000);
 }
 
@@ -1333,7 +1262,6 @@ async function cancelJob() {
   loadHistory();
 }
 
-// ── Live sync ──────────────────────────────────────────────
 function showLive() {
   document.getElementById('live-card').classList.remove('hidden');
 }
@@ -1344,8 +1272,7 @@ async function startLive() {
   const dest   = document.getElementById('dest-select').value;
   const types  = getMediaTypes();
   if (!source || !dest) return alert('Select source and destination first');
-  const r = await api('/start_live', 'POST',
-    { source, dest, media_types: types });
+  const r = await api('/start_live', 'POST', { source, dest, media_types: types });
   if (r.ok) {
     currentLiveSrcId = r.src_id;
     document.getElementById('live-status-box').innerHTML =
@@ -1364,7 +1291,6 @@ async function stopLive() {
   }
 }
 
-// ── Boot ───────────────────────────────────────────────────
 checkAuth();
 </script>
 </body>
