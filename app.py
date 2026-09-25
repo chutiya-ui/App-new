@@ -1,55 +1,456 @@
-# --- app.py ---
-
-import asyncio
-import io
-import os
-import threading
-from flask import Flask, render_template_string, request, jsonify, session
-from telethon import TelegramClient
+import os, asyncio, threading, hashlib, logging, json
+from datetime import datetime
+from flask import Flask, request, jsonify, session, render_template_string
+from telethon import TelegramClient, events
+from telethon.tl.types import (
+    DocumentAttributeVideo, DocumentAttributeFilename,
+    MessageMediaPhoto, MessageMediaDocument
+)
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageMediaDocument, DocumentAttributeFilename
-from telethon.errors import FloodWaitError, SessionPasswordNeededError
+import nest_asyncio
+import sqlite3
+
+nest_asyncio.apply()
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+API_ID   = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH", "")
+SECRET_KEY = os.environ.get("SECRET_KEY", "changeme")
+SESSION_STRING = os.environ.get("SESSION_STRING", "")
+
+CLIENT_KWARGS = dict(
+    device_model="Samsung Galaxy S23",
+    system_version="Android 13",
+    app_version="9.6.7",
+    lang_code="en",
+    system_lang_code="en-US"
+)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "sentinelflow-secret-2024")
+app.secret_key = SECRET_KEY
 
-API_ID   = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-
-# --- persistent state ---
-auth_clients: dict  = {}   # phone -> TelegramClient (kept alive during auth)
-auth_sessions: dict = {}   # phone -> session string (post auth)
-phone_hashes: dict  = {}   # phone -> phone_code_hash (required for sign_in)
-
-# one shared event loop for all Telethon calls
+DB_PATH = "/tmp/forwarder.db"
 _loop = asyncio.new_event_loop()
+_client = None
+_jobs = {}
 
-def _run(coro):
-    """Submit a coroutine to the shared loop from any thread."""
-    fut = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return fut.result(timeout=60)
+# ── Database ───────────────────────────────────────────────
+def db():
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
 
-def _start_loop():
+def init_db():
+    with db() as c:
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS forwarded (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT,
+                message_id  INTEGER,
+                file_hash   TEXT,
+                media_type  TEXT,
+                forwarded_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id          INTEGER PRIMARY KEY,
+                session_str TEXT,
+                saved_at    TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS duplicates (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash   TEXT UNIQUE,
+                first_msg_id INTEGER,
+                source      TEXT,
+                detected_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+init_db()
+
+# ── Session persistence ────────────────────────────────────
+def save_session_to_db(session_str: str):
+    with db() as c:
+        c.execute("DELETE FROM sessions")
+        c.execute("INSERT INTO sessions (session_str) VALUES (?)", (session_str,))
+        c.commit()
+    log.info("Session saved to DB")
+
+def load_session_from_db() -> str:
+    with db() as c:
+        row = c.execute("SELECT session_str FROM sessions ORDER BY id DESC LIMIT 1").fetchone()
+    return row["session_str"] if row else ""
+
+def get_best_session() -> str:
+    # Priority: env var > DB > empty
+    if SESSION_STRING:
+        return SESSION_STRING
+    return load_session_from_db()
+
+# ── File hash for duplicate detection ─────────────────────
+def compute_hash(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def is_duplicate(file_hash: str, source: str, msg_id: int) -> bool:
+    with db() as c:
+        row = c.execute(
+            "SELECT id FROM duplicates WHERE file_hash = ?", (file_hash,)
+        ).fetchone()
+        if row:
+            return True
+        c.execute(
+            "INSERT INTO duplicates (file_hash, first_msg_id, source) VALUES (?,?,?)",
+            (file_hash, msg_id, source)
+        )
+        c.commit()
+    return False
+
+def already_forwarded_by_id(job_id: str, msg_id: int) -> bool:
+    with db() as c:
+        row = c.execute(
+            "SELECT id FROM forwarded WHERE job_id=? AND message_id=?",
+            (job_id, msg_id)
+        ).fetchone()
+    return row is not None
+
+def record_forwarded(job_id, msg_id, file_hash, media_type):
+    with db() as c:
+        c.execute(
+            "INSERT INTO forwarded (job_id, message_id, file_hash, media_type) VALUES (?,?,?,?)",
+            (job_id, msg_id, file_hash or "", media_type)
+        )
+        c.commit()
+
+# ── Telethon client ────────────────────────────────────────
+def run_in_loop(coro):
+    return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=120)
+
+def start_loop():
     asyncio.set_event_loop(_loop)
     _loop.run_forever()
 
-_loop_thread = threading.Thread(target=_start_loop, daemon=True)
-_loop_thread.start()
+threading.Thread(target=start_loop, daemon=True).start()
 
-job = {
-    "running":   False,
-    "log":       [],
-    "forwarded": 0,
-    "failed":    0,
-    "skipped":   0,
-    "total":     0,
-    "done":      False,
-    "mode":      None,
-}
+async def get_client() -> TelegramClient:
+    global _client
+    if _client and _client.is_connected():
+        # Auto-save session every time client is fetched
+        ss = _client.session.save()
+        if ss:
+            save_session_to_db(ss)
+        return _client
+    best = get_best_session()
+    if best:
+        _client = TelegramClient(StringSession(best), API_ID, API_HASH, **CLIENT_KWARGS)
+        await _client.connect()
+        if await _client.is_user_authorized():
+            ss = _client.session.save()
+            save_session_to_db(ss)
+            log.info("Restored session successfully")
+            return _client
+    _client = TelegramClient(StringSession(), API_ID, API_HASH, **CLIENT_KWARGS)
+    await _client.connect()
+    return _client
 
-# ─────────────────────────────────────────
-#  HTML
-# ─────────────────────────────────────────
+# ── Auth routes ────────────────────────────────────────────
+@app.route("/send_code", methods=["POST"])
+def send_code_route():
+    phone = request.json.get("phone")
+    async def _send():
+        c = await get_client()
+        r = await c.send_code_request(phone)
+        return r.phone_code_hash
+    try:
+        h = run_in_loop(_send())
+        session["phone"] = phone
+        session["hash"] = h
+        return jsonify(ok=True)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+@app.route("/sign_in", methods=["POST"])
+def sign_in_route():
+    code = request.json.get("code")
+    pw   = request.json.get("password", "")
+    async def _sign():
+        c = await get_client()
+        try:
+            await c.sign_in(session["phone"], code, phone_code_hash=session["hash"])
+        except Exception as e:
+            if "two" in str(e).lower() or "password" in str(e).lower():
+                if pw:
+                    await c.sign_in(password=pw)
+                else:
+                    raise Exception("2FA_REQUIRED")
+        ss = c.session.save()
+        save_session_to_db(ss)
+        return ss
+    try:
+        ss = run_in_loop(_sign())
+        session["auth"] = True
+        return jsonify(ok=True, session_string=ss)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+@app.route("/check_auth")
+def check_auth():
+    async def _check():
+        c = await get_client()
+        return await c.is_user_authorized()
+    try:
+        ok = run_in_loop(_check())
+        if ok:
+            session["auth"] = True
+        return jsonify(authed=ok)
+    except:
+        return jsonify(authed=False)
+
+# ── Dialogs ────────────────────────────────────────────────
+@app.route("/dialogs")
+def get_dialogs():
+    async def _get():
+        c = await get_client()
+        if not await c.is_user_authorized():
+            raise Exception("Not authorized")
+        dialogs = await c.get_dialogs(limit=200)
+        return [
+            {"id": str(d.id), "name": d.name or "Unknown", "type": type(d.entity).__name__}
+            for d in dialogs if d.name
+        ]
+    try:
+        return jsonify(dialogs=run_in_loop(_get()))
+    except Exception as e:
+        return jsonify(error=str(e)), 401
+
+# ── Duplicate check route ──────────────────────────────────
+@app.route("/scan_duplicates", methods=["POST"])
+def scan_duplicates():
+    """Scan source channel and return duplicate media before forwarding"""
+    data = request.json
+    source = data.get("source")
+    media_types = data.get("media_types", ["video", "photo", "document"])
+    limit = int(data.get("limit", 100))
+
+    async def _scan():
+        c = await get_client()
+        entity = await c.get_entity(source)
+        seen_hashes = {}
+        duplicates_found = []
+        async for msg in c.iter_messages(entity, limit=limit):
+            if not msg.media:
+                continue
+            mtype = _get_media_type(msg)
+            if mtype not in media_types:
+                continue
+            try:
+                data_bytes = await c.download_media(msg, file=bytes)
+                if not data_bytes:
+                    continue
+                fh = compute_hash(data_bytes)
+                if fh in seen_hashes:
+                    duplicates_found.append({
+                        "msg_id": msg.id,
+                        "duplicate_of": seen_hashes[fh],
+                        "type": mtype,
+                        "size": len(data_bytes),
+                        "date": str(msg.date)
+                    })
+                else:
+                    seen_hashes[fh] = msg.id
+            except Exception as ex:
+                log.warning(f"Could not scan msg {msg.id}: {ex}")
+        return duplicates_found
+
+    try:
+        dupes = run_in_loop(_scan())
+        return jsonify(ok=True, duplicates=dupes, count=len(dupes))
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
+
+def _get_media_type(msg) -> str:
+    if isinstance(msg.media, MessageMediaPhoto):
+        return "photo"
+    if isinstance(msg.media, MessageMediaDocument):
+        doc = msg.document
+        for attr in (doc.attributes or []):
+            if isinstance(attr, DocumentAttributeVideo):
+                return "video"
+        return "document"
+    return "other"
+
+# ── Forward job ────────────────────────────────────────────
+@app.route("/start_job", methods=["POST"])
+def start_job():
+    data = request.json
+    job_id = datetime.now().strftime("%Y%m%d%H%M%S")
+    media_types = data.get("media_types", ["video", "photo", "document", "text"])
+    skip_duplicates = data.get("skip_duplicates", True)
+
+    _jobs[job_id] = {
+        "status": "running",
+        "done": 0,
+        "skipped": 0,
+        "duplicates_skipped": 0,
+        "errors": 0,
+        "logs": [],
+        "media_types": media_types,
+        "skip_duplicates": skip_duplicates
+    }
+
+    def _run():
+        asyncio.run_coroutine_threadsafe(
+            forward_job_async(job_id, data), _loop
+        )
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify(ok=True, job_id=job_id)
+
+async def forward_job_async(job_id: str, cfg: dict):
+    job = _jobs[job_id]
+
+    def log_msg(m):
+        job["logs"].append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
+        log.info(m)
+
+    try:
+        c = await get_client()
+        src = await c.get_entity(cfg["source"])
+        dst = await c.get_entity(cfg["dest"])
+        limit = int(cfg.get("limit", 100))
+        media_types = cfg.get("media_types", ["video", "photo", "document", "text"])
+        skip_dupes = cfg.get("skip_duplicates", True)
+        pin_first = cfg.get("pin_first", True)
+        pin_every = int(cfg.get("pin_every", 200))
+        pin_counter = 0
+        first_pinned = False
+
+        log_msg(f"Starting job: {cfg['source']} → {cfg['dest']} | types={media_types}")
+
+        async for msg in c.iter_messages(src, limit=limit):
+            if job["status"] == "cancelled":
+                log_msg("Job cancelled by user")
+                break
+
+            # Message ID dedup
+            if already_forwarded_by_id(job_id, msg.id):
+                job["skipped"] += 1
+                continue
+
+            # Media type filter
+            mtype = _get_media_type(msg) if msg.media else "text"
+            if mtype not in media_types:
+                job["skipped"] += 1
+                continue
+
+            file_hash = None
+
+            # Content hash duplicate detection
+            if skip_dupes and msg.media and mtype in ["video", "photo", "document"]:
+                try:
+                    raw = await c.download_media(msg, file=bytes)
+                    if raw:
+                        file_hash = compute_hash(raw)
+                        if is_duplicate(file_hash, str(src.id), msg.id):
+                            job["duplicates_skipped"] += 1
+                            log_msg(f"⚠️ Duplicate detected — skipping msg {msg.id}")
+                            continue
+                except Exception as ex:
+                    log_msg(f"Hash check failed for {msg.id}: {ex}")
+
+            # Forward or re-upload
+            try:
+                sent = None
+                caption = msg.text or ""
+
+                if msg.media:
+                    # Try direct forward first
+                    try:
+                        sent = await c.forward_messages(dst, msg.id, src)
+                        log_msg(f"✅ Forwarded msg {msg.id} ({mtype})")
+                    except Exception:
+                        # Re-upload with metadata preserved
+                        if not hasattr(locals(), 'raw') or raw is None:
+                            raw = await c.download_media(msg, file=bytes)
+
+                        orig_attrs = []
+                        thumb = None
+
+                        if msg.document:
+                            orig_attrs = msg.document.attributes or []
+                            if msg.document.thumbs:
+                                thumb = await c.download_media(
+                                    msg.document.thumbs[-1], file=bytes
+                                )
+
+                        import io
+                        buf = io.BytesIO(raw)
+                        buf.name = "media.mp4" if mtype == "video" else "media.jpg"
+
+                        sent = await c.send_file(
+                            dst,
+                            file=buf,
+                            caption=caption,
+                            attributes=orig_attrs,
+                            thumb=thumb,
+                            supports_streaming=True
+                        )
+                        log_msg(f"✅ Re-uploaded msg {msg.id} ({mtype}) with metadata")
+                else:
+                    if "text" in media_types and msg.text:
+                        sent = await c.send_message(dst, msg.text)
+                        log_msg(f"✅ Sent text msg {msg.id}")
+
+                # Auto-pin logic
+                if sent:
+                    pin_counter += 1
+                    if pin_first and not first_pinned:
+                        await c.pin_message(dst, sent.id, notify=False)
+                        first_pinned = True
+                        log_msg(f"📌 Pinned first message {sent.id}")
+                    elif pin_counter % pin_every == 0:
+                        await c.pin_message(dst, sent.id, notify=False)
+                        log_msg(f"📌 Auto-pinned message {sent.id} (every {pin_every})")
+
+                record_forwarded(job_id, msg.id, file_hash, mtype)
+                job["done"] += 1
+
+            except Exception as ex:
+                job["errors"] += 1
+                log_msg(f"❌ Error on msg {msg.id}: {ex}")
+
+            await asyncio.sleep(1.5)
+
+        job["status"] = "done"
+        # Save session after job completes
+        ss = c.session.save()
+        if ss:
+            save_session_to_db(ss)
+        log_msg(f"── Job complete ── Forwarded: {job['done']} | Skipped: {job['skipped']} | Dupes: {job['duplicates_skipped']} | Errors: {job['errors']}")
+
+    except Exception as e:
+        job["status"] = "error"
+        job["logs"].append(f"FATAL: {e}")
+        log.error(e)
+
+@app.route("/job_status/<job_id>")
+def job_status(job_id):
+    j = _jobs.get(job_id)
+    if not j:
+        return jsonify(error="Job not found"), 404
+    return jsonify(j)
+
+@app.route("/cancel_job/<job_id>", methods=["POST"])
+def cancel_job(job_id):
+    if job_id in _jobs:
+        _jobs[job_id]["status"] = "cancelled"
+        return jsonify(ok=True)
+    return jsonify(ok=False)
+
+# ── Main UI ────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return render_template_string(HTML)
 
 HTML = """
 <!DOCTYPE html>
@@ -57,717 +458,275 @@ HTML = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TG Channel Forwarder</title>
+<title>TG Forwarder Pro</title>
 <style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  background: #0d1117;
-  color: #e6edf3;
-  font-family: 'Segoe UI', system-ui, sans-serif;
-  min-height: 100vh;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding: 40px 16px;
-}
-.card {
-  background: #161b22;
-  border: 1px solid #30363d;
-  border-radius: 12px;
-  padding: 32px;
-  width: 100%;
-  max-width: 680px;
-}
-h1 { font-size: 1.4rem; font-weight: 600; color: #58a6ff; margin-bottom: 6px; }
-.subtitle { font-size: 0.85rem; color: #8b949e; margin-bottom: 28px; }
-label {
-  display: block;
-  font-size: 0.8rem;
-  color: #8b949e;
-  margin-bottom: 6px;
-  font-weight: 500;
-  letter-spacing: 0.03em;
-}
-input[type=text], input[type=number], input[type=password], input[type=tel] {
-  width: 100%;
-  background: #0d1117;
-  border: 1px solid #30363d;
-  border-radius: 6px;
-  color: #e6edf3;
-  font-size: 0.9rem;
-  padding: 10px 14px;
-  margin-bottom: 18px;
-  outline: none;
-  transition: border-color 0.15s;
-}
-input:focus { border-color: #58a6ff; }
-.row { display: flex; gap: 16px; }
-.row > div { flex: 1; }
-.badge {
-  display: inline-block;
-  font-size: 0.7rem;
-  padding: 2px 10px;
-  border-radius: 20px;
-  margin-bottom: 18px;
-  font-weight: 600;
-}
-.badge-blue   { background: #1f3a5f; color: #58a6ff; }
-.badge-green  { background: #1a3a2a; color: #3fb950; }
-.badge-red    { background: #3a1a1a; color: #f85149; }
-.badge-yellow { background: #3a2f0a; color: #d29922; }
-button {
-  width: 100%;
-  padding: 12px;
-  background: #238636;
-  border: none;
-  border-radius: 6px;
-  color: #fff;
-  font-size: 0.95rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background 0.15s;
-  margin-top: 4px;
-}
-button:hover:not(:disabled) { background: #2ea043; }
-button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
-button.secondary {
-  background: #21262d;
-  border: 1px solid #30363d;
-  color: #8b949e;
-  margin-top: 10px;
-}
-button.secondary:hover:not(:disabled) { background: #30363d; color: #e6edf3; }
-.stats { display: flex; gap: 12px; margin: 24px 0 16px; }
-.stat {
-  flex: 1;
-  background: #0d1117;
-  border: 1px solid #30363d;
-  border-radius: 8px;
-  padding: 12px;
-  text-align: center;
-}
-.stat-num { font-size: 1.6rem; font-weight: 700; color: #58a6ff; }
-.stat-num.green { color: #3fb950; }
-.stat-num.red   { color: #f85149; }
-.stat-num.gray  { color: #8b949e; }
-.stat-label {
-  font-size: 0.72rem;
-  color: #8b949e;
-  margin-top: 2px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-.progress-wrap {
-  background: #0d1117;
-  border-radius: 4px;
-  height: 6px;
-  margin-bottom: 16px;
-  overflow: hidden;
-  border: 1px solid #21262d;
-}
-.progress-bar {
-  height: 100%;
-  background: #238636;
-  transition: width 0.4s ease;
-  border-radius: 4px;
-}
-#log-box {
-  background: #0d1117;
-  border: 1px solid #21262d;
-  border-radius: 6px;
-  height: 260px;
-  overflow-y: auto;
-  padding: 12px 14px;
-  font-family: 'Courier New', monospace;
-  font-size: 0.78rem;
-  color: #8b949e;
-}
-.log-line { margin-bottom: 4px; line-height: 1.5; }
-.log-line.ok   { color: #3fb950; }
-.log-line.err  { color: #f85149; }
-.log-line.info { color: #58a6ff; }
-.log-line.warn { color: #d29922; }
-.divider { border: none; border-top: 1px solid #21262d; margin: 24px 0; }
-.auth-status {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 20px;
-  font-size: 0.85rem;
-}
-.dot { width: 8px; height: 8px; border-radius: 50%; background: #f85149; flex-shrink: 0; }
-.dot.green  { background: #3fb950; }
-.dot.yellow { background: #d29922; }
-.step-label {
-  font-size: 0.75rem;
-  color: #8b949e;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  margin-bottom: 14px;
-  font-weight: 600;
-}
-.hidden { display: none; }
-.error-msg { color: #f85149; font-size: 0.82rem; margin-top: -12px; margin-bottom: 14px; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0f0f1a; color: #e0e0e0; min-height: 100vh; }
+  .container { max-width: 900px; margin: 0 auto; padding: 20px; }
+  h1 { text-align: center; color: #7c83fd; margin-bottom: 24px; font-size: 1.8rem; }
+  .card { background: #1a1a2e; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #2a2a4a; }
+  .card h2 { color: #7c83fd; margin-bottom: 16px; font-size: 1.1rem; }
+  input, select { width: 100%; padding: 10px 14px; background: #0f0f1a; border: 1px solid #3a3a5a; border-radius: 8px; color: #e0e0e0; margin-bottom: 12px; font-size: 0.95rem; }
+  button { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 0.95rem; font-weight: 600; transition: 0.2s; }
+  .btn-primary { background: #7c83fd; color: #fff; width: 100%; margin-top: 4px; }
+  .btn-primary:hover { background: #5c63dd; }
+  .btn-danger { background: #e74c3c; color: #fff; }
+  .btn-sm { padding: 6px 14px; font-size: 0.85rem; }
+  .status { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+  .status.running { background: #27ae60; color: #fff; }
+  .status.done { background: #2980b9; color: #fff; }
+  .status.error { background: #e74c3c; color: #fff; }
+  .status.cancelled { background: #7f8c8d; color: #fff; }
+  .log-box { background: #0a0a14; border-radius: 8px; padding: 12px; font-family: monospace; font-size: 0.82rem; max-height: 220px; overflow-y: auto; color: #a0f0a0; border: 1px solid #2a2a4a; }
+  .checkbox-group { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
+  .checkbox-group label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.9rem; }
+  .checkbox-group input[type=checkbox] { width: auto; margin: 0; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
+  .stat { background: #0f0f1a; border-radius: 8px; padding: 10px; text-align: center; border: 1px solid #2a2a4a; }
+  .stat .num { font-size: 1.4rem; font-weight: 700; color: #7c83fd; }
+  .stat .lbl { font-size: 0.75rem; color: #888; }
+  .dupe-list { max-height: 150px; overflow-y: auto; font-size: 0.82rem; }
+  .dupe-item { padding: 6px; border-bottom: 1px solid #2a2a4a; display: flex; justify-content: space-between; }
+  .hidden { display: none; }
+  .session-badge { background: #27ae60; color: #fff; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; }
+  .session-badge.offline { background: #e74c3c; }
+  #auth-section select { margin-bottom: 12px; }
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>⚡ TG Channel Forwarder</h1>
-  <p class="subtitle">Smart forward detection — copies direct or re-uploads clean. No forward tag.</p>
+<div class="container">
+  <h1>🚀 TG Forwarder Pro</h1>
 
-  <div class="auth-status">
-    <div class="dot" id="auth-dot"></div>
-    <span id="auth-label">Not logged in</span>
-    <button class="secondary" id="logout-btn"
-      style="width:auto;padding:4px 12px;font-size:0.78rem;margin-top:0;"
-      onclick="logout()">Logout</button>
-  </div>
-
-  <!-- STEP 1: PHONE -->
-  <div id="step-phone">
-    <div class="step-label">Step 1 — Telegram phone number</div>
-    <label>PHONE NUMBER (with country code)</label>
-    <input type="tel" id="phone" placeholder="+1234567890">
-    <div class="error-msg hidden" id="phone-err"></div>
-    <button id="phone-btn" onclick="sendPhone()">Send Code</button>
-  </div>
-
-  <!-- STEP 2: CODE -->
-  <div id="step-code" class="hidden">
-    <div class="step-label">Step 2 — Verification code</div>
-    <label>CODE (from Telegram app)</label>
-    <input type="text" id="code" placeholder="12345" maxlength="10">
-    <div class="error-msg hidden" id="code-err"></div>
-    <button id="code-btn" onclick="sendCode()">Verify Code</button>
-    <button class="secondary" onclick="backToPhone()">← Back</button>
-  </div>
-
-  <!-- STEP 2B: 2FA -->
-  <div id="step-2fa" class="hidden">
-    <div class="step-label">Step 2B — Two-factor authentication</div>
-    <label>TELEGRAM PASSWORD</label>
-    <input type="password" id="twofa" placeholder="Your 2FA password">
-    <div class="error-msg hidden" id="twofa-err"></div>
-    <button id="twofa-btn" onclick="send2FA()">Submit Password</button>
-  </div>
-
-  <!-- STEP 3: FORWARDER -->
-  <div id="step-forwarder" class="hidden">
-    <hr class="divider">
-    <form id="job-form">
-      <div class="row">
-        <div>
-          <label>SOURCE CHANNEL</label>
-          <input type="text" id="source" placeholder="@channel or invite link" required>
-        </div>
-        <div>
-          <label>DESTINATION CHANNEL</label>
-          <input type="text" id="dest" placeholder="@yourchannel" required>
-        </div>
+  <!-- Auth Card -->
+  <div class="card" id="auth-card">
+    <h2>🔐 Authentication <span id="session-badge" class="session-badge offline">Checking...</span></h2>
+    <div id="auth-section">
+      <input type="tel" id="phone" placeholder="Phone number (+91...)" />
+      <button class="btn-primary" onclick="sendCode()">Send Code</button>
+      <div id="code-section" class="hidden">
+        <input type="text" id="code" placeholder="Enter OTP code" />
+        <input type="password" id="twofa" placeholder="2FA Password (if enabled)" />
+        <button class="btn-primary" onclick="signIn()">Verify & Login</button>
       </div>
-      <label>MESSAGE LIMIT (0 = all)</label>
-      <input type="number" id="limit" value="0" min="0">
-      <div class="badge badge-blue" id="mode-badge">⏳ Mode detected after start</div>
-      <button type="submit" id="start-btn">▶ Start Forwarding</button>
-    </form>
+    </div>
+    <div id="auth-info" class="hidden" style="color:#27ae60; font-size:0.9rem; margin-top:8px;"></div>
+  </div>
 
+  <!-- Forward Config Card -->
+  <div class="card hidden" id="forward-card">
+    <h2>⚙️ Forward Configuration</h2>
+    <label style="font-size:0.85rem; color:#aaa; margin-bottom:4px; display:block;">Source Channel</label>
+    <select id="source-select"><option value="">Loading dialogs...</option></select>
+    <label style="font-size:0.85rem; color:#aaa; margin-bottom:4px; display:block;">Destination Channel</label>
+    <select id="dest-select"><option value="">Loading dialogs...</option></select>
+    <label style="font-size:0.85rem; color:#aaa; margin-bottom:4px; display:block;">Message Limit</label>
+    <input type="number" id="limit" value="100" min="1" max="10000" />
+
+    <label style="font-size:0.85rem; color:#aaa; margin-bottom:8px; display:block;">Content Types to Forward:</label>
+    <div class="checkbox-group">
+      <label><input type="checkbox" id="type-video" checked> 🎥 Videos</label>
+      <label><input type="checkbox" id="type-photo" checked> 🖼️ Photos</label>
+      <label><input type="checkbox" id="type-document" checked> 📄 Documents</label>
+      <label><input type="checkbox" id="type-text"> 💬 Text Messages</label>
+    </div>
+
+    <label style="font-size:0.85rem; color:#aaa; margin-bottom:8px; display:block;">Options:</label>
+    <div class="checkbox-group">
+      <label><input type="checkbox" id="skip-dupes" checked> 🔍 Skip duplicate files (hash check)</label>
+      <label><input type="checkbox" id="pin-first" checked> 📌 Pin first message</label>
+    </div>
+    <input type="number" id="pin-every" value="200" min="1" placeholder="Pin every N messages" />
+    <small style="color:#888; display:block; margin-bottom:12px;">Auto-pin every N forwarded messages</small>
+
+    <button class="btn-primary" onclick="scanDuplicates()" style="background:#e67e22; margin-bottom:8px;">🔍 Scan for Duplicates First</button>
+    <button class="btn-primary" onclick="startJob()">▶️ Start Forwarding</button>
+  </div>
+
+  <!-- Duplicate Report Card -->
+  <div class="card hidden" id="dupe-card">
+    <h2>⚠️ Duplicate Report</h2>
+    <div id="dupe-summary" style="margin-bottom:10px; font-size:0.9rem;"></div>
+    <div class="dupe-list" id="dupe-list"></div>
+    <button class="btn-primary" style="margin-top:12px;" onclick="startJob()">▶️ Continue (Skip Duplicates)</button>
+  </div>
+
+  <!-- Job Monitor Card -->
+  <div class="card hidden" id="job-card">
+    <h2>📊 Job Monitor <span id="job-status-badge" class="status running">running</span></h2>
     <div class="stats">
-      <div class="stat">
-        <div class="stat-num green" id="s-forwarded">0</div>
-        <div class="stat-label">Forwarded</div>
-      </div>
-      <div class="stat">
-        <div class="stat-num gray" id="s-skipped">0</div>
-        <div class="stat-label">Skipped</div>
-      </div>
-      <div class="stat">
-        <div class="stat-num red" id="s-failed">0</div>
-        <div class="stat-label">Failed</div>
-      </div>
-      <div class="stat">
-        <div class="stat-num" id="s-total">0</div>
-        <div class="stat-label">Total</div>
-      </div>
+      <div class="stat"><div class="num" id="stat-done">0</div><div class="lbl">Forwarded</div></div>
+      <div class="stat"><div class="num" id="stat-skipped">0</div><div class="lbl">Skipped</div></div>
+      <div class="stat"><div class="num" id="stat-dupes">0</div><div class="lbl">Dupes Blocked</div></div>
+      <div class="stat"><div class="num" id="stat-errors">0</div><div class="lbl">Errors</div></div>
     </div>
-
-    <div class="progress-wrap">
-      <div class="progress-bar" id="progress" style="width:0%"></div>
-    </div>
-    <div id="log-box"></div>
+    <div class="log-box" id="log-box">Waiting for logs...</div>
+    <button class="btn-danger btn-sm" style="margin-top:10px;" onclick="cancelJob()">⏹ Cancel Job</button>
   </div>
+
 </div>
 
 <script>
-let polling     = null;
-let logOffset   = 0;
-let currentPhone = "";
+let currentJobId = null;
+let pollInterval = null;
+let dialogsCache = [];
 
-window.addEventListener('DOMContentLoaded', async () => {
-  const res  = await fetch('/auth/status');
-  const data = await res.json();
-  if (data.logged_in) {
-    currentPhone = data.phone || "";
-    showForwarder(data.phone);
+async function api(url, method='GET', body=null) {
+  const opts = { method, headers: {'Content-Type':'application/json'} };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(url, opts);
+  return r.json();
+}
+
+async function checkAuth() {
+  const r = await api('/check_auth');
+  const badge = document.getElementById('session-badge');
+  if (r.authed) {
+    badge.textContent = '✅ Session Active';
+    badge.className = 'session-badge';
+    document.getElementById('auth-info').textContent = 'Session restored automatically — no login needed.';
+    document.getElementById('auth-info').classList.remove('hidden');
+    document.getElementById('auth-section').classList.add('hidden');
+    document.getElementById('forward-card').classList.remove('hidden');
+    loadDialogs();
   } else {
-    showPhone();
+    badge.textContent = '❌ Not Logged In';
+    badge.className = 'session-badge offline';
   }
-});
-
-function setDot(state) {
-  const dot   = document.getElementById('auth-dot');
-  const label = document.getElementById('auth-label');
-  dot.className = 'dot';
-  if (state === 'green')  { dot.classList.add('green');  label.textContent = 'Logged in'; }
-  if (state === 'yellow') { dot.classList.add('yellow'); label.textContent = 'Authenticating…'; }
-  if (state === 'red')    {                              label.textContent = 'Not logged in'; }
-}
-
-function showPhone() {
-  hide(['step-code','step-2fa','step-forwarder']);
-  show(['step-phone']);
-  setDot('red');
-  document.getElementById('logout-btn').style.display = 'none';
-}
-function showCode()     { hide(['step-phone','step-2fa','step-forwarder']); show(['step-code']);     setDot('yellow'); }
-function show2FA()      { hide(['step-phone','step-code','step-forwarder']); show(['step-2fa']);     setDot('yellow'); }
-function showForwarder(phone) {
-  hide(['step-phone','step-code','step-2fa']);
-  show(['step-forwarder']);
-  setDot('green');
-  document.getElementById('auth-label').textContent = 'Logged in' + (phone ? ' · ' + phone : '');
-  document.getElementById('logout-btn').style.display = '';
-}
-function backToPhone()  { hide(['step-code']); show(['step-phone']); setDot('red'); }
-function hide(ids)      { ids.forEach(id => document.getElementById(id).classList.add('hidden')); }
-function show(ids)      { ids.forEach(id => document.getElementById(id).classList.remove('hidden')); }
-function showErr(id, m) { const e = document.getElementById(id); e.textContent = m; e.classList.remove('hidden'); }
-function clearErr(id)   { document.getElementById(id).classList.add('hidden'); }
-
-async function sendPhone() {
-  clearErr('phone-err');
-  const phone = document.getElementById('phone').value.trim();
-  if (!phone) { showErr('phone-err', 'Enter your phone number.'); return; }
-  currentPhone = phone;
-  const btn = document.getElementById('phone-btn');
-  btn.disabled = true; btn.textContent = 'Sending…';
-  const res  = await fetch('/auth/send_code', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ phone }),
-  });
-  const data = await res.json();
-  btn.disabled = false; btn.textContent = 'Send Code';
-  data.ok ? showCode() : showErr('phone-err', data.error || 'Failed to send code.');
 }
 
 async function sendCode() {
-  clearErr('code-err');
-  const code = document.getElementById('code').value.trim();
-  if (!code) { showErr('code-err', 'Enter the code.'); return; }
-  const btn = document.getElementById('code-btn');
-  btn.disabled = true; btn.textContent = 'Verifying…';
-  const res  = await fetch('/auth/verify_code', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ phone: currentPhone, code }),
-  });
-  const data = await res.json();
-  btn.disabled = false; btn.textContent = 'Verify Code';
-  if (data.ok)        { showForwarder(currentPhone); }
-  else if (data.need_2fa) { show2FA(); }
-  else                { showErr('code-err', data.error || 'Invalid code.'); }
-}
-
-async function send2FA() {
-  clearErr('twofa-err');
-  const password = document.getElementById('twofa').value;
-  if (!password) { showErr('twofa-err', 'Enter your 2FA password.'); return; }
-  const btn = document.getElementById('twofa-btn');
-  btn.disabled = true; btn.textContent = 'Submitting…';
-  const res  = await fetch('/auth/verify_2fa', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ phone: currentPhone, password }),
-  });
-  const data = await res.json();
-  btn.disabled = false; btn.textContent = 'Submit Password';
-  data.ok ? showForwarder(currentPhone) : showErr('twofa-err', data.error || 'Wrong password.');
-}
-
-async function logout() {
-  await fetch('/auth/logout', { method: 'POST' });
-  showPhone();
-}
-
-function appendLog(lines) {
-  const box = document.getElementById('log-box');
-  lines.forEach(l => {
-    const div = document.createElement('div');
-    div.className = 'log-line ' + (l.level || '');
-    div.textContent = l.text;
-    box.appendChild(div);
-  });
-  box.scrollTop = box.scrollHeight;
-}
-
-function updateStats(data) {
-  document.getElementById('s-forwarded').textContent = data.forwarded;
-  document.getElementById('s-skipped').textContent   = data.skipped;
-  document.getElementById('s-failed').textContent    = data.failed;
-  document.getElementById('s-total').textContent     = data.total;
-  const done = data.forwarded + data.skipped + data.failed;
-  const pct  = data.total > 0 ? Math.min(100, Math.round(done / data.total * 100)) : 0;
-  document.getElementById('progress').style.width = pct + '%';
-  if (data.mode) {
-    const badge = document.getElementById('mode-badge');
-    if (data.mode === 'copy') {
-      badge.className = 'badge badge-green';
-      badge.textContent = '✓ Mode: Direct copy (forwarding allowed)';
-    } else {
-      badge.className = 'badge badge-red';
-      badge.textContent = '⚠ Mode: Re-upload (forwarding restricted)';
-    }
+  const phone = document.getElementById('phone').value.trim();
+  if (!phone) return alert('Enter phone number');
+  const r = await api('/send_code', 'POST', {phone});
+  if (r.ok) {
+    document.getElementById('code-section').classList.remove('hidden');
+    alert('OTP sent to your Telegram app');
+  } else {
+    alert('Error: ' + r.error);
   }
 }
 
-async function poll() {
-  try {
-    const res  = await fetch('/status?offset=' + logOffset);
-    const data = await res.json();
-    if (data.new_logs && data.new_logs.length) {
-      appendLog(data.new_logs);
-      logOffset += data.new_logs.length;
+async function signIn() {
+  const code = document.getElementById('code').value.trim();
+  const password = document.getElementById('twofa').value.trim();
+  const r = await api('/sign_in', 'POST', {code, password});
+  if (r.ok) {
+    document.getElementById('session-badge').textContent = '✅ Session Active';
+    document.getElementById('session-badge').className = 'session-badge';
+    document.getElementById('auth-section').classList.add('hidden');
+    document.getElementById('auth-info').textContent = '✅ Logged in! Session saved permanently.';
+    document.getElementById('auth-info').classList.remove('hidden');
+    document.getElementById('forward-card').classList.remove('hidden');
+    loadDialogs();
+    if (r.session_string) {
+      console.log('SESSION_STRING (save to Railway env):', r.session_string);
     }
-    updateStats(data);
-    if (data.done) {
-      clearInterval(polling);
-      const btn = document.getElementById('start-btn');
-      btn.disabled = false;
-      btn.textContent = '▶ Run Again';
-      appendLog([{ text: '── job complete ──', level: 'info' }]);
-    }
-  } catch(e) { console.error(e); }
+  } else {
+    alert('Login failed: ' + r.error);
+  }
 }
 
-document.getElementById('job-form').addEventListener('submit', async e => {
-  e.preventDefault();
-  logOffset = 0;
-  document.getElementById('log-box').innerHTML = '';
-  const btn = document.getElementById('start-btn');
-  btn.disabled = true; btn.textContent = 'Running…';
-  await fetch('/start', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({
-      source: document.getElementById('source').value.trim(),
-      dest:   document.getElementById('dest').value.trim(),
-      limit:  parseInt(document.getElementById('limit').value) || 0,
-      phone:  currentPhone,
-    }),
+async function loadDialogs() {
+  const r = await api('/dialogs');
+  if (r.error) { alert('Could not load dialogs: ' + r.error); return; }
+  dialogsCache = r.dialogs;
+  const srcSel = document.getElementById('source-select');
+  const dstSel = document.getElementById('dest-select');
+  srcSel.innerHTML = '';
+  dstSel.innerHTML = '';
+  r.dialogs.forEach(d => {
+    const o1 = new Option(`${d.name} (${d.type})`, d.id);
+    const o2 = new Option(`${d.name} (${d.type})`, d.id);
+    srcSel.add(o1);
+    dstSel.add(o2);
   });
-  polling = setInterval(poll, 1500);
-});
+}
+
+function getMediaTypes() {
+  const types = [];
+  if (document.getElementById('type-video').checked)    types.push('video');
+  if (document.getElementById('type-photo').checked)    types.push('photo');
+  if (document.getElementById('type-document').checked) types.push('document');
+  if (document.getElementById('type-text').checked)     types.push('text');
+  return types;
+}
+
+async function scanDuplicates() {
+  const source = document.getElementById('source-select').value;
+  const limit  = document.getElementById('limit').value;
+  const types  = getMediaTypes().filter(t => t !== 'text');
+  if (!source) return alert('Select a source channel');
+  const r = await api('/scan_duplicates', 'POST', {source, limit, media_types: types});
+  const card = document.getElementById('dupe-card');
+  const summary = document.getElementById('dupe-summary');
+  const list = document.getElementById('dupe-list');
+  card.classList.remove('hidden');
+  if (r.ok) {
+    summary.textContent = `Found ${r.count} duplicate file(s) in source channel.`;
+    list.innerHTML = r.duplicates.map(d =>
+      `<div class="dupe-item"><span>Msg #${d.msg_id} (${d.type})</span><span>Duplicate of #${d.duplicate_of} | ${(d.size/1024/1024).toFixed(1)}MB</span></div>`
+    ).join('') || '<div style="color:#888; padding:8px;">No duplicates found ✅</div>';
+  } else {
+    summary.textContent = 'Scan failed: ' + r.error;
+  }
+}
+
+async function startJob() {
+  const source = document.getElementById('source-select').value;
+  const dest   = document.getElementById('dest-select').value;
+  const limit  = document.getElementById('limit').value;
+  const types  = getMediaTypes();
+  if (!source || !dest) return alert('Select source and destination');
+  if (types.length === 0) return alert('Select at least one content type');
+  const r = await api('/start_job', 'POST', {
+    source, dest, limit,
+    media_types: types,
+    skip_duplicates: document.getElementById('skip-dupes').checked,
+    pin_first: document.getElementById('pin-first').checked,
+    pin_every: document.getElementById('pin-every').value
+  });
+  if (r.ok) {
+    currentJobId = r.job_id;
+    document.getElementById('job-card').classList.remove('hidden');
+    document.getElementById('dupe-card').classList.add('hidden');
+    startPolling();
+  } else {
+    alert('Failed to start job');
+  }
+}
+
+function startPolling() {
+  if (pollInterval) clearInterval(pollInterval);
+  pollInterval = setInterval(async () => {
+    if (!currentJobId) return;
+    const j = await api(`/job_status/${currentJobId}`);
+    document.getElementById('stat-done').textContent    = j.done || 0;
+    document.getElementById('stat-skipped').textContent = j.skipped || 0;
+    document.getElementById('stat-dupes').textContent   = j.duplicates_skipped || 0;
+    document.getElementById('stat-errors').textContent  = j.errors || 0;
+    const badge = document.getElementById('job-status-badge');
+    badge.textContent = j.status;
+    badge.className = `status ${j.status}`;
+    const lb = document.getElementById('log-box');
+    lb.innerHTML = (j.logs || []).slice(-50).join('<br>');
+    lb.scrollTop = lb.scrollHeight;
+    if (['done','error','cancelled'].includes(j.status)) {
+      clearInterval(pollInterval);
+    }
+  }, 2000);
+}
+
+async function cancelJob() {
+  if (!currentJobId) return;
+  await api(`/cancel_job/${currentJobId}`, 'POST');
+}
+
+// On page load, check if session already exists
+checkAuth();
 </script>
 </body>
 </html>
 """
-
-# ─────────────────────────────────────────
-#  HELPERS
-# ─────────────────────────────────────────
-
-def log_push(text: str, level: str = "") -> None:
-    job["log"].append({"text": text, "level": level})
-
-
-def is_video(message) -> bool:
-    if not isinstance(message.media, MessageMediaDocument):
-        return False
-    for attr in message.media.document.attributes:
-        if type(attr).__name__ == "DocumentAttributeVideo":
-            return True
-    mime = getattr(message.media.document, "mime_type", "") or ""
-    return mime.startswith("video/")
-
-
-async def copy_message_buf(client: TelegramClient, message, dest_entity) -> None:
-    buf = io.BytesIO()
-    await client.download_media(message, file=buf)
-    buf.seek(0)
-
-    doc   = message.media.document
-    mime  = getattr(doc, "mime_type", "video/mp4") or "video/mp4"
-    fname = None
-    for attr in doc.attributes:
-        fname = getattr(attr, "file_name", None)
-        if fname:
-            break
-    if not fname:
-        ext   = mime.split("/")[-1] if "/" in mime else "mp4"
-        fname = f"{message.id}.{ext}"
-
-    uploaded = await client.upload_file(buf, file_name=fname)
-    await client.send_file(
-        dest_entity,
-        uploaded,
-        caption=message.text or "",
-        attributes=[DocumentAttributeFilename(file_name=fname)],
-    )
-
-# ─────────────────────────────────────────
-#  AUTH ROUTES — all run on shared _loop
-# ─────────────────────────────────────────
-
-@app.route("/auth/status")
-def auth_status():
-    phone = session.get("phone")
-    if phone and phone in auth_sessions:
-        return jsonify({"logged_in": True, "phone": phone})
-    return jsonify({"logged_in": False})
-
-
-@app.route("/auth/send_code", methods=["POST"])
-def send_code_route():
-    data  = request.get_json()
-    phone = data.get("phone", "").strip()
-    if not phone:
-        return jsonify({"ok": False, "error": "Phone required"})
-
-    async def _send():
-        # clean up any stale client for this phone
-        old = auth_clients.get(phone)
-        if old:
-            try:
-                await old.disconnect()
-            except Exception:
-                pass
-
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        result = await client.send_code_request(phone)
-        auth_clients[phone]  = client
-        phone_hashes[phone]  = result.phone_code_hash
-
-    try:
-        _run(_send())
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-
-@app.route("/auth/verify_code", methods=["POST"])
-def verify_code_route():
-    data  = request.get_json()
-    phone = data.get("phone", "").strip()
-    code  = data.get("code",  "").strip()
-
-    if phone not in auth_clients:
-        return jsonify({"ok": False, "error": "Session expired — send code again."})
-
-    async def _verify():
-        client     = auth_clients[phone]
-        code_hash  = phone_hashes.get(phone)
-        await client.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
-        session_str           = client.session.save()
-        auth_sessions[phone]  = session_str
-        await client.disconnect()
-        auth_clients.pop(phone, None)
-        phone_hashes.pop(phone, None)
-
-    try:
-        _run(_verify())
-        session["phone"] = phone
-        return jsonify({"ok": True})
-    except SessionPasswordNeededError:
-        return jsonify({"ok": False, "need_2fa": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-
-@app.route("/auth/verify_2fa", methods=["POST"])
-def verify_2fa_route():
-    data     = request.get_json()
-    phone    = data.get("phone",    "").strip()
-    password = data.get("password", "")
-
-    if phone not in auth_clients:
-        return jsonify({"ok": False, "error": "Session expired — send code again."})
-
-    async def _2fa():
-        client = auth_clients[phone]
-        await client.sign_in(password=password)
-        session_str           = client.session.save()
-        auth_sessions[phone]  = session_str
-        await client.disconnect()
-        auth_clients.pop(phone, None)
-        phone_hashes.pop(phone, None)
-
-    try:
-        _run(_2fa())
-        session["phone"] = phone
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-
-@app.route("/auth/logout", methods=["POST"])
-def logout_route():
-    phone = session.pop("phone", None)
-    if phone:
-        async def _disc():
-            c = auth_clients.pop(phone, None)
-            if c:
-                try:
-                    await c.disconnect()
-                except Exception:
-                    pass
-        _run(_disc())
-        auth_sessions.pop(phone, None)
-        phone_hashes.pop(phone, None)
-    return jsonify({"ok": True})
-
-# ─────────────────────────────────────────
-#  FORWARDER JOB
-# ─────────────────────────────────────────
-
-async def forward_job(session_string: str, source_id: str, dest_id: str, limit: int) -> None:
-    job.update({
-        "running":   True,
-        "log":       [],
-        "forwarded": 0,
-        "failed":    0,
-        "skipped":   0,
-        "total":     0,
-        "done":      False,
-        "mode":      None,
-    })
-
-    try:
-        async with TelegramClient(StringSession(session_string), API_ID, API_HASH) as client:
-            log_push("Connected.", "info")
-
-            try:
-                source = await client.get_entity(source_id)
-            except Exception as e:
-                log_push(f"Could not resolve source: {e}", "err")
-                return
-
-            try:
-                dest = await client.get_entity(dest_id)
-            except Exception as e:
-                log_push(f"Could not resolve destination: {e}", "err")
-                return
-
-            log_push(f"Source : {getattr(source, 'title', source_id)}", "info")
-            log_push(f"Dest   : {getattr(dest,   'title', dest_id)}",   "info")
-
-            no_forwards = getattr(source, "noforwards", False)
-            if no_forwards:
-                job["mode"] = "reupload"
-                log_push("Forwarding restricted — re-upload mode.", "warn")
-            else:
-                job["mode"] = "copy"
-                log_push("Forwarding allowed — direct copy mode.", "ok")
-
-            msg_limit = limit if limit > 0 else None
-            messages  = [m async for m in client.iter_messages(source, limit=msg_limit)]
-            job["total"] = sum(1 for m in messages if m.media and is_video(m))
-            log_push(f"Videos found: {job['total']}", "info")
-
-            for message in messages:
-                if not message.media or not is_video(message):
-                    job["skipped"] += 1
-                    continue
-
-                try:
-                    if no_forwards:
-                        await copy_message_buf(client, message, dest)
-                        log_push(f"[{job['forwarded']+1}] Re-uploaded msg {message.id}", "ok")
-                    else:
-                        await client.forward_messages(dest, message, source)
-                        log_push(f"[{job['forwarded']+1}] Forwarded msg {message.id}", "ok")
-
-                    job["forwarded"] += 1
-                    await asyncio.sleep(2.0)
-
-                except FloodWaitError as e:
-                    log_push(f"FloodWait {e.seconds}s — pausing.", "warn")
-                    await asyncio.sleep(e.seconds + 2)
-                    try:
-                        if no_forwards:
-                            await copy_message_buf(client, message, dest)
-                        else:
-                            await client.forward_messages(dest, message, source)
-                        job["forwarded"] += 1
-                        log_push(f"Retry ok — msg {message.id}", "ok")
-                    except Exception as retry_err:
-                        log_push(f"Retry failed msg {message.id}: {retry_err}", "err")
-                        job["failed"] += 1
-
-                except Exception as e:
-                    log_push(f"Failed msg {message.id}: {e}", "err")
-                    job["failed"] += 1
-
-            log_push(
-                f"Done — forwarded: {job['forwarded']} | "
-                f"failed: {job['failed']} | skipped: {job['skipped']}",
-                "info"
-            )
-
-    except Exception as e:
-        log_push(f"Fatal: {e}", "err")
-    finally:
-        job["running"] = False
-        job["done"]    = True
-
-
-def run_async_job(session_string: str, source: str, dest: str, limit: int) -> None:
-    asyncio.run(forward_job(session_string, source, dest, limit))
-
-
-@app.route("/")
-def index():
-    return render_template_string(HTML)
-
-
-@app.route("/start", methods=["POST"])
-def start():
-    if job["running"]:
-        return jsonify({"error": "Job already running"}), 409
-
-    data   = request.get_json()
-    phone  = data.get("phone",  "").strip()
-    source = data.get("source", "").strip()
-    dest   = data.get("dest",   "").strip()
-    limit  = int(data.get("limit", 0))
-
-    if not source or not dest:
-        return jsonify({"error": "Source and destination required"}), 400
-
-    session_string = auth_sessions.get(phone)
-    if not session_string:
-        return jsonify({"error": "Not authenticated — log in first"}), 401
-
-    t = threading.Thread(
-        target=run_async_job,
-        args=(session_string, source, dest, limit),
-        daemon=True,
-    )
-    t.start()
-    return jsonify({"status": "started"})
-
-
-@app.route("/status")
-def status():
-    offset   = int(request.args.get("offset", 0))
-    new_logs = job["log"][offset:]
-    return jsonify({
-        "running":   job["running"],
-        "done":      job["done"],
-        "forwarded": job["forwarded"],
-        "failed":    job["failed"],
-        "skipped":   job["skipped"],
-        "total":     job["total"],
-        "mode":      job.get("mode"),
-        "new_logs":  new_logs,
-    })
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
