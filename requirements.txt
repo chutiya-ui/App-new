@@ -1,0 +1,5 @@
+flask>=3.0
+telethon==1.45.0
+gunicorn>=22.0
+cryptography>=42.0
+cryptg>=0.4
