@@ -15,10 +15,9 @@ nest_asyncio.apply()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-API_ID         = int(os.environ.get("API_ID", "0"))
-API_HASH       = os.environ.get("API_HASH", "")
-SECRET_KEY     = os.environ.get("SECRET_KEY", "changeme")
-SESSION_STRING = os.environ.get("SESSION_STRING", "")
+API_ID    = int(os.environ.get("API_ID", "0"))
+API_HASH  = os.environ.get("API_HASH", "")
+SECRET_KEY = os.environ.get("SECRET_KEY", "changeme")
 
 CLIENT_KWARGS = dict(
     device_model="Samsung Galaxy S23",
@@ -55,11 +54,6 @@ def init_db():
                 media_type   TEXT,
                 forwarded_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(job_key, message_id)
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                id          INTEGER PRIMARY KEY,
-                session_str TEXT,
-                saved_at    TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS duplicates (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,134 +99,9 @@ def self_ping():
 
 threading.Thread(target=self_ping, daemon=True).start()
 
-# ── Session helpers ────────────────────────────────────────
-def save_session_to_db(ss: str):
-    try:
-        with db() as c:
-            c.execute("DELETE FROM sessions")
-            c.execute("INSERT INTO sessions (session_str) VALUES (?)", (ss,))
-            c.commit()
-    except Exception as e:
-        log.warning(f"save_session_to_db failed: {e}")
-
-def load_session_from_db() -> str:
-    try:
-        with db() as c:
-            row = c.execute(
-                "SELECT session_str FROM sessions ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        return row["session_str"] if row else ""
-    except Exception:
-        return ""
-
-def get_best_session() -> str:
-    return SESSION_STRING or load_session_from_db()
-
-# ── Instant routes — no Telethon, no async ────────────────
 @app.route("/ping")
 def ping():
     return jsonify(status="alive", time=str(datetime.now()))
-
-@app.route("/session_exists")
-def session_exists():
-    if not API_ID or API_ID == 0 or not API_HASH:
-        return jsonify(exists=False, error="API_ID or API_HASH missing in Railway variables")
-    ss = get_best_session()
-    return jsonify(exists=bool(ss))
-
-# ── Job DB helpers ─────────────────────────────────────────
-def job_key_for(source: str, dest: str) -> str:
-    return hashlib.md5(f"{source}|{dest}".encode()).hexdigest()[:12]
-
-def db_create_or_resume_job(job_key, source, dest, config: dict):
-    with db() as c:
-        existing = c.execute(
-            "SELECT job_key FROM jobs WHERE job_key=?", (job_key,)
-        ).fetchone()
-        if existing:
-            c.execute(
-                "UPDATE jobs SET status='running', updated_at=? WHERE job_key=?",
-                (datetime.now().isoformat(), job_key)
-            )
-        else:
-            c.execute(
-                "INSERT INTO jobs (job_key,source,dest,status,config) VALUES (?,?,?,?,?)",
-                (job_key, source, dest, "running", json.dumps(config))
-            )
-        c.commit()
-
-def db_update_job(job_key, **kwargs):
-    kwargs["updated_at"] = datetime.now().isoformat()
-    sets = ", ".join(f"{k}=?" for k in kwargs)
-    vals = list(kwargs.values()) + [job_key]
-    with db() as c:
-        c.execute(f"UPDATE jobs SET {sets} WHERE job_key=?", vals)
-        c.commit()
-
-def db_get_job(job_key):
-    with db() as c:
-        row = c.execute(
-            "SELECT * FROM jobs WHERE job_key=?", (job_key,)
-        ).fetchone()
-    return dict(row) if row else None
-
-def db_all_jobs():
-    with db() as c:
-        rows = c.execute(
-            "SELECT * FROM jobs ORDER BY updated_at DESC LIMIT 20"
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-def db_log(job_key, message):
-    ts = datetime.now().strftime('%H:%M:%S')
-    entry = f"[{ts}] {message}"
-    with db() as c:
-        c.execute(
-            "INSERT INTO job_logs (job_key, message) VALUES (?,?)",
-            (job_key, entry)
-        )
-        c.commit()
-    log.info(message)
-
-def db_get_logs(job_key, last_n=100):
-    with db() as c:
-        rows = c.execute(
-            "SELECT message FROM job_logs WHERE job_key=? ORDER BY id DESC LIMIT ?",
-            (job_key, last_n)
-        ).fetchall()
-    return [r["message"] for r in reversed(rows)]
-
-def already_forwarded(job_key: str, msg_id: int) -> bool:
-    with db() as c:
-        row = c.execute(
-            "SELECT id FROM forwarded WHERE job_key=? AND message_id=?",
-            (job_key, msg_id)
-        ).fetchone()
-    return row is not None
-
-def record_forwarded(job_key, msg_id, file_hash, media_type):
-    with db() as c:
-        c.execute(
-            "INSERT OR IGNORE INTO forwarded "
-            "(job_key, message_id, file_hash, media_type) VALUES (?,?,?,?)",
-            (job_key, msg_id, file_hash or "", media_type)
-        )
-        c.commit()
-
-def hash_already_seen(file_hash: str) -> bool:
-    with db() as c:
-        row = c.execute(
-            "SELECT id FROM duplicates WHERE file_hash=?", (file_hash,)
-        ).fetchone()
-    return row is not None
-
-def record_hash(file_hash: str, msg_id: int, source: str):
-    with db() as c:
-        c.execute(
-            "INSERT OR IGNORE INTO duplicates (file_hash,first_msg_id,source) VALUES (?,?,?)",
-            (file_hash, msg_id, source)
-        )
-        c.commit()
 
 # ── Telethon loop ──────────────────────────────────────────
 def run_in_loop(coro, timeout=30):
@@ -247,28 +116,7 @@ threading.Thread(target=start_loop, daemon=True).start()
 async def get_client() -> TelegramClient:
     global _client
     if _client and _client.is_connected():
-        if await _client.is_user_authorized():
-            ss = _client.session.save()
-            if ss:
-                save_session_to_db(ss)
-            return _client
-        await _client.disconnect()
-        _client = None
-
-    best = get_best_session()
-    if best:
-        _client = TelegramClient(
-            StringSession(best), API_ID, API_HASH, **CLIENT_KWARGS
-        )
-        await _client.connect()
-        if await _client.is_user_authorized():
-            ss = _client.session.save()
-            save_session_to_db(ss)
-            log.info("Session restored")
-            return _client
-        await _client.disconnect()
-        _client = None
-
+        return _client
     _client = TelegramClient(StringSession(), API_ID, API_HASH, **CLIENT_KWARGS)
     await _client.connect()
     return _client
@@ -402,6 +250,100 @@ async def process_message(client, msg, src, dst, job_key,
             counters["errors"] += 1
         db_log(job_key, f"❌ Error {msg.id}: {ex}")
 
+# ── Job DB helpers ─────────────────────────────────────────
+def job_key_for(source: str, dest: str) -> str:
+    return hashlib.md5(f"{source}|{dest}".encode()).hexdigest()[:12]
+
+def db_create_or_resume_job(job_key, source, dest, config: dict):
+    with db() as c:
+        existing = c.execute(
+            "SELECT job_key FROM jobs WHERE job_key=?", (job_key,)
+        ).fetchone()
+        if existing:
+            c.execute(
+                "UPDATE jobs SET status='running', updated_at=? WHERE job_key=?",
+                (datetime.now().isoformat(), job_key)
+            )
+        else:
+            c.execute(
+                "INSERT INTO jobs (job_key,source,dest,status,config) VALUES (?,?,?,?,?)",
+                (job_key, source, dest, "running", json.dumps(config))
+            )
+        c.commit()
+
+def db_update_job(job_key, **kwargs):
+    kwargs["updated_at"] = datetime.now().isoformat()
+    sets = ", ".join(f"{k}=?" for k in kwargs)
+    vals = list(kwargs.values()) + [job_key]
+    with db() as c:
+        c.execute(f"UPDATE jobs SET {sets} WHERE job_key=?", vals)
+        c.commit()
+
+def db_get_job(job_key):
+    with db() as c:
+        row = c.execute(
+            "SELECT * FROM jobs WHERE job_key=?", (job_key,)
+        ).fetchone()
+    return dict(row) if row else None
+
+def db_all_jobs():
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM jobs ORDER BY updated_at DESC LIMIT 20"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def db_log(job_key, message):
+    ts = datetime.now().strftime('%H:%M:%S')
+    entry = f"[{ts}] {message}"
+    with db() as c:
+        c.execute(
+            "INSERT INTO job_logs (job_key, message) VALUES (?,?)",
+            (job_key, entry)
+        )
+        c.commit()
+    log.info(message)
+
+def db_get_logs(job_key, last_n=100):
+    with db() as c:
+        rows = c.execute(
+            "SELECT message FROM job_logs WHERE job_key=? ORDER BY id DESC LIMIT ?",
+            (job_key, last_n)
+        ).fetchall()
+    return [r["message"] for r in reversed(rows)]
+
+def already_forwarded(job_key: str, msg_id: int) -> bool:
+    with db() as c:
+        row = c.execute(
+            "SELECT id FROM forwarded WHERE job_key=? AND message_id=?",
+            (job_key, msg_id)
+        ).fetchone()
+    return row is not None
+
+def record_forwarded(job_key, msg_id, file_hash, media_type):
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO forwarded "
+            "(job_key, message_id, file_hash, media_type) VALUES (?,?,?,?)",
+            (job_key, msg_id, file_hash or "", media_type)
+        )
+        c.commit()
+
+def hash_already_seen(file_hash: str) -> bool:
+    with db() as c:
+        row = c.execute(
+            "SELECT id FROM duplicates WHERE file_hash=?", (file_hash,)
+        ).fetchone()
+    return row is not None
+
+def record_hash(file_hash: str, msg_id: int, source: str):
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO duplicates (file_hash,first_msg_id,source) VALUES (?,?,?)",
+            (file_hash, msg_id, source)
+        )
+        c.commit()
+
 # ── Forward job ────────────────────────────────────────────
 async def forward_job_async(job_key: str, cfg: dict):
     try:
@@ -495,10 +437,6 @@ async def forward_job_async(job_key: str, cfg: dict):
         if job["status"] != "cancelled":
             db_update_job(job_key, status="done")
 
-        ss = c.session.save()
-        if ss:
-            save_session_to_db(ss)
-
         db_log(job_key,
                f"── Complete ── Done:{counters['done']} "
                f"Skipped:{counters['skipped']} "
@@ -550,14 +488,12 @@ def sign_in_route():
                     await c.sign_in(password=pw)
                 else:
                     raise Exception("2FA_REQUIRED")
-        ss = c.session.save()
-        save_session_to_db(ss)
-        return ss
+        return True
 
     try:
-        ss = run_in_loop(_sign())
+        run_in_loop(_sign())
         session["auth"] = True
-        return jsonify(ok=True, session_string=ss)
+        return jsonify(ok=True)
     except Exception as e:
         return jsonify(ok=False, error=str(e))
 
@@ -566,14 +502,10 @@ def check_auth():
     async def _check():
         c = await get_client()
         return await c.is_user_authorized()
-
     try:
         ok = run_in_loop(_check(), timeout=15)
-        if ok:
-            session["auth"] = True
-        return jsonify(authed=ok)
+        return jsonify(authed=bool(ok))
     except Exception as e:
-        log.error(f"check_auth error: {e}")
         return jsonify(authed=False, error=str(e))
 
 # ── Dialogs ────────────────────────────────────────────────
@@ -760,7 +692,7 @@ def scan_duplicates():
             if mtype not in media_types:
                 continue
             try:
-                raw = await client.download_media(msg, file=bytes)
+                raw = await c.download_media(msg, file=bytes)
                 if not raw:
                     continue
                 fh = compute_hash(raw)
@@ -845,14 +777,14 @@ select[multiple] { height: 140px; }
   <h1>🚀 TG Forwarder Pro</h1>
 
   <div class="card" id="auth-card">
-    <h2>🔐 Authentication <span id="session-badge" class="badge red">Checking...</span></h2>
+    <h2>🔐 Login to Telegram</h2>
     <div id="auth-section">
       <input type="tel" id="phone" placeholder="Phone number (+91...)" />
-      <button class="btn-primary btn-full" onclick="sendCode()">Send Code</button>
+      <button class="btn-primary btn-full" onclick="sendCode()">📲 Send Code</button>
       <div id="code-section" class="hidden">
         <input type="text"     id="code"  placeholder="Enter OTP code" />
         <input type="password" id="twofa" placeholder="2FA Password (if enabled)" />
-        <button class="btn-primary btn-full" onclick="signIn()">Verify & Login</button>
+        <button class="btn-primary btn-full" onclick="signIn()">✅ Verify & Login</button>
       </div>
     </div>
     <div id="auth-info" class="hidden"
@@ -904,7 +836,7 @@ select[multiple] { height: 140px; }
       <div class="stat"><div class="num" id="stat-dupes">0</div><div class="lbl">Dupes</div></div>
       <div class="stat"><div class="num" id="stat-errors">0</div><div class="lbl">Errors</div></div>
     </div>
-    <div class="log-box" id="log-box">Loading logs...</div>
+    <div class="log-box" id="log-box">Waiting for logs...</div>
     <div class="btn-group" style="margin-top:10px;">
       <button class="btn-danger btn-sm" onclick="cancelJob()">⏹ Cancel Job</button>
     </div>
@@ -954,56 +886,15 @@ async function api(url, method = 'GET', body = null) {
   return r.json();
 }
 
-async function checkAuth() {
-  const badge = document.getElementById('session-badge');
-  badge.textContent = 'Checking...';
-  badge.className   = 'badge red';
-
-  // Always show login form immediately — never block the UI
-  document.getElementById('auth-section').classList.remove('hidden');
-
-  try {
-    const exists = await api('/session_exists');
-
-    if (!exists.exists) {
-      badge.textContent = '❌ Not logged in';
-      badge.className   = 'badge red';
-      return;
-    }
-
-    badge.textContent = 'Connecting...';
-
-    const result = await Promise.race([
-      api('/check_auth'),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('timeout')), 10000)
-      )
-    ]);
-
-    if (result.authed) {
-      badge.textContent = '✅ Session Active';
-      badge.className   = 'badge green';
-      document.getElementById('auth-section').classList.add('hidden');
-      document.getElementById('auth-info').textContent = '✅ Session restored automatically.';
-      document.getElementById('auth-info').classList.remove('hidden');
-      document.getElementById('forward-card').classList.remove('hidden');
-      loadDialogs();
-      loadHistory();
-    } else {
-      badge.textContent = '❌ Session expired — please log in';
-      badge.className   = 'badge red';
-    }
-
-  } catch (e) {
-    badge.textContent = '⚠️ Could not connect — please log in';
-    badge.className   = 'badge red';
-    console.warn('checkAuth:', e.message);
-  }
-}
 async function sendCode() {
   const phone = document.getElementById('phone').value.trim();
   if (!phone) return alert('Enter phone number');
+  const btn = event.target;
+  btn.textContent = 'Sending...';
+  btn.disabled = true;
   const r = await api('/send_code', 'POST', { phone });
+  btn.textContent = '📲 Send Code';
+  btn.disabled = false;
   if (r.ok) {
     document.getElementById('code-section').classList.remove('hidden');
     alert('OTP sent to Telegram');
@@ -1015,16 +906,18 @@ async function sendCode() {
 async function signIn() {
   const code     = document.getElementById('code').value.trim();
   const password = document.getElementById('twofa').value.trim();
+  const btn = event.target;
+  btn.textContent = 'Verifying...';
+  btn.disabled = true;
   const r = await api('/sign_in', 'POST', { code, password });
+  btn.textContent = '✅ Verify & Login';
+  btn.disabled = false;
   if (r.ok) {
-    document.getElementById('session-badge').textContent = '✅ Session Active';
-    document.getElementById('session-badge').className   = 'badge green';
-    document.getElementById('auth-section').classList.add('hidden');
-    document.getElementById('auth-info').textContent =
-      '✅ Logged in! Copy session string from browser console (F12) and save to Railway as SESSION_STRING.';
+    document.getElementById('auth-card').style.borderColor = '#27ae60';
+    document.getElementById('auth-info').textContent = '✅ Logged in successfully!';
     document.getElementById('auth-info').classList.remove('hidden');
+    document.getElementById('auth-section').classList.add('hidden');
     document.getElementById('forward-card').classList.remove('hidden');
-    console.log('SESSION_STRING:', r.session_string);
     loadDialogs();
     loadHistory();
   } else {
@@ -1035,12 +928,7 @@ async function signIn() {
 async function loadDialogs() {
   const r = await api('/dialogs');
   if (r.error) {
-    if (r.error.includes('authorized') || r.error.includes('401')) {
-      document.getElementById('auth-section').classList.remove('hidden');
-      document.getElementById('forward-card').classList.add('hidden');
-    } else {
-      alert('Could not load dialogs: ' + r.error);
-    }
+    alert('Could not load dialogs: ' + r.error);
     return;
   }
   const srcSel = document.getElementById('source-select');
@@ -1278,8 +1166,6 @@ async function stopLive() {
     document.getElementById('live-status-box').textContent = '⏹ Stopped.';
   }
 }
-
-checkAuth();
 </script>
 </body>
 </html>
