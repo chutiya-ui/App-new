@@ -112,6 +112,12 @@ def ping():
 
 threading.Thread(target=self_ping, daemon=True).start()
 
+@app.route("/session_exists")
+def session_exists():
+    """Fast check — does a session string exist anywhere, without connecting"""
+    ss = get_best_session()
+    return jsonify(exists=bool(ss))
+
 # ── Session helpers ────────────────────────────────────────
 def save_session_to_db(ss: str):
     with db() as c:
@@ -991,35 +997,7 @@ async function api(url, method='GET', body=null) {
 }
 
 // ── Auth ───────────────────────────────────────────────────
-async function checkAuth() {
-  const badge = document.getElementById('session-badge');
-  badge.textContent = '⏳ Connecting...';
-  try {
-    const r = await api('/check_auth');
-    if (r.authed) {
-      badge.textContent = '✅ Session Active';
-      badge.className   = 'badge green';
-      document.getElementById('auth-info').textContent =
-        'Session restored automatically.';
-      document.getElementById('auth-info').classList.remove('hidden');
-      document.getElementById('auth-section').classList.add('hidden');
-      document.getElementById('forward-card').classList.remove('hidden');
-      loadDialogs();
-      loadHistory();
-    } else {
-      badge.textContent = '❌ Not Logged In';
-      badge.className   = 'badge red';
-      if (r.error) {
-        console.warn('Auth check error:', r.error);
-      }
-    }
-  } catch (e) {
-    badge.textContent = '⚠️ Connection Error — Retrying...';
-    badge.className   = 'badge red';
-    // Retry after 4 seconds automatically
-    setTimeout(checkAuth, 4000);
-  }
-}
+
 
 async function sendCode() {
   const phone = document.getElementById('phone').value.trim();
