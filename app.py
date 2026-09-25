@@ -224,8 +224,8 @@ def record_hash(file_hash: str, msg_id: int, source: str):
         c.commit()
 
 # ── Telethon loop ──────────────────────────────────────────
-def run_in_loop(coro):
-    return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=120)
+def run_in_loop(coro, timeout=60):
+    return asyncio.run_coroutine_threadsafe(coro, _loop).result(timeout=timeout)
 
 def start_loop():
     asyncio.set_event_loop(_loop)
@@ -992,21 +992,32 @@ async function api(url, method='GET', body=null) {
 
 // ── Auth ───────────────────────────────────────────────────
 async function checkAuth() {
-  const r     = await api('/check_auth');
   const badge = document.getElementById('session-badge');
-  if (r.authed) {
-    badge.textContent = '✅ Session Active';
-    badge.className   = 'badge green';
-    document.getElementById('auth-info').textContent =
-      'Session restored automatically.';
-    document.getElementById('auth-info').classList.remove('hidden');
-    document.getElementById('auth-section').classList.add('hidden');
-    document.getElementById('forward-card').classList.remove('hidden');
-    loadDialogs();
-    loadHistory();
-  } else {
-    badge.textContent = '❌ Not Logged In';
+  badge.textContent = '⏳ Connecting...';
+  try {
+    const r = await api('/check_auth');
+    if (r.authed) {
+      badge.textContent = '✅ Session Active';
+      badge.className   = 'badge green';
+      document.getElementById('auth-info').textContent =
+        'Session restored automatically.';
+      document.getElementById('auth-info').classList.remove('hidden');
+      document.getElementById('auth-section').classList.add('hidden');
+      document.getElementById('forward-card').classList.remove('hidden');
+      loadDialogs();
+      loadHistory();
+    } else {
+      badge.textContent = '❌ Not Logged In';
+      badge.className   = 'badge red';
+      if (r.error) {
+        console.warn('Auth check error:', r.error);
+      }
+    }
+  } catch (e) {
+    badge.textContent = '⚠️ Connection Error — Retrying...';
     badge.className   = 'badge red';
+    // Retry after 4 seconds automatically
+    setTimeout(checkAuth, 4000);
   }
 }
 
