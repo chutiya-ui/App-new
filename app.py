@@ -114,9 +114,13 @@ threading.Thread(target=self_ping, daemon=True).start()
 
 @app.route("/session_exists")
 def session_exists():
-    """Fast check — does a session string exist anywhere, without connecting"""
     ss = get_best_session()
-    return jsonify(exists=bool(ss))
+    if not ss:
+        return jsonify(exists=False)
+    # Also do a quick API_ID sanity check so we don't try to connect with empty creds
+    if not API_ID or not API_HASH:
+        return jsonify(exists=False, error="API_ID or API_HASH missing")
+    return jsonify(exists=True)
 
 # ── Session helpers ────────────────────────────────────────
 def save_session_to_db(ss: str):
@@ -615,7 +619,7 @@ def check_auth():
         c = await get_client()
         return await c.is_user_authorized()
     try:
-        ok = run_in_loop(_check())
+        ok = run_in_loop(_check(),timeout=15)
         if ok:
             session["auth"] = True
         return jsonify(authed=ok)
@@ -1008,26 +1012,30 @@ async function checkAuth() {
   badge.className   = 'badge red';
 
   try {
-    // Fast path — does a session string exist at all?
     const exists = await api('/session_exists');
+
     if (!exists.exists) {
-      // No session saved — show login form immediately
       badge.textContent = '❌ Not logged in';
       badge.className   = 'badge red';
       document.getElementById('auth-section').classList.remove('hidden');
       return;
     }
 
-    // Session exists — try to validate it with Telethon
     badge.textContent = 'Connecting...';
-    const r = await api('/check_auth');
 
-    if (r.authed) {
+    // Race between the real check and a 12-second timeout
+    const result = await Promise.race([
+      api('/check_auth'),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('timeout')), 12000)
+      )
+    ]);
+
+    if (result.authed) {
       badge.textContent = '✅ Session Active';
       badge.className   = 'badge green';
       document.getElementById('auth-section').classList.add('hidden');
-      document.getElementById('auth-info').textContent =
-        '✅ Session restored automatically.';
+      document.getElementById('auth-info').textContent = '✅ Session restored.';
       document.getElementById('auth-info').classList.remove('hidden');
       document.getElementById('forward-card').classList.remove('hidden');
       loadDialogs();
@@ -1037,12 +1045,15 @@ async function checkAuth() {
       badge.className   = 'badge red';
       document.getElementById('auth-section').classList.remove('hidden');
     }
+
   } catch (e) {
-    // Network error or timeout — don't freeze, just show login
-    badge.textContent = '⚠️ Connection error';
+    // Timeout or network error — show login form, never freeze
+    badge.textContent = '⚠️ Tap to retry';
     badge.className   = 'badge red';
+    badge.style.cursor = 'pointer';
+    badge.onclick = () => checkAuth();
     document.getElementById('auth-section').classList.remove('hidden');
-    console.error('checkAuth error:', e);
+    console.warn('checkAuth:', e.message);
   }
 }
 
