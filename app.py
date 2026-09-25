@@ -608,8 +608,9 @@ def check_auth():
         if ok:
             session["auth"] = True
         return jsonify(authed=ok)
-    except:
-        return jsonify(authed=False)
+    except Exception as e:
+        log.error(f"check_auth error: {e}")
+        return jsonify(authed=False, error=str(e))
 
 # ── Dialogs ────────────────────────────────────────────────
 @app.route("/dialogs")
