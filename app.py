@@ -105,10 +105,6 @@ def self_ping():
 
 threading.Thread(target=self_ping, daemon=True).start()
 
-@app.route("/ping")
-def ping():
-    return jsonify(status="alive", time=str(datetime.now()))
-
 # ── Session helpers ────────────────────────────────────────
 def save_session_to_db(ss: str):
     try:
