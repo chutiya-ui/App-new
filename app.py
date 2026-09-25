@@ -763,7 +763,7 @@ select[multiple] { height: 140px; }
       Paste it below and click Connect.
     </p>
     <textarea id="session-input" placeholder="Paste your Telethon session string here..."></textarea>
-    <button class="btn-primary btn-full" onclick="doLogin()">🔌 Connect</button>
+    <button class="btn-primary btn-full" id="connect-btn" onclick="doLogin(event)">🔌 Connect</button>
     <div id="auth-error" class="hidden"
          style="color:#e74c3c;font-size:0.9rem;margin-top:8px;"></div>
     <div id="auth-info" class="hidden"
@@ -865,11 +865,13 @@ async function api(url, method = 'GET', body = null) {
   return r.json();
 }
 
-async function doLogin() {
-  const ss  = document.getElementById('session-input').value.trim();
-  const btn = document.querySelector('#auth-card button');
-  const err = document.getElementById('auth-error');
-  const inf = document.getElementById('auth-info');
+async function doLogin(event) {
+  if (event) event.preventDefault();
+  const ssEl = document.getElementById('session-input');
+  const ss   = ssEl ? ssEl.value.trim() : '';
+  const btn  = document.getElementById('connect-btn');
+  const err  = document.getElementById('auth-error');
+  const inf  = document.getElementById('auth-info');
 
   if (!ss) {
     err.textContent = '⚠️ Please paste your session string first.';
@@ -881,21 +883,27 @@ async function doLogin() {
   btn.disabled    = true;
   err.classList.add('hidden');
 
-  const r = await api('/login', 'POST', { session_string: ss });
+  try {
+    const r = await api('/login', 'POST', { session_string: ss });
+    btn.textContent = '🔌 Connect';
+    btn.disabled    = false;
 
-  btn.textContent = '🔌 Connect';
-  btn.disabled    = false;
-
-  if (r.ok) {
-    inf.textContent = '✅ Connected successfully!';
-    inf.classList.remove('hidden');
-    document.getElementById('session-input').value = '';
-    document.getElementById('forward-card').classList.remove('hidden');
-    document.getElementById('auth-card').style.borderColor = '#27ae60';
-    loadDialogs();
-    loadHistory();
-  } else {
-    err.textContent = '❌ ' + r.error;
+    if (r.ok) {
+      inf.textContent = '✅ Connected successfully!';
+      inf.classList.remove('hidden');
+      ssEl.value = '';
+      document.getElementById('forward-card').classList.remove('hidden');
+      document.getElementById('auth-card').style.borderColor = '#27ae60';
+      loadDialogs();
+      loadHistory();
+    } else {
+      err.textContent = '❌ ' + r.error;
+      err.classList.remove('hidden');
+    }
+  } catch (e) {
+    btn.textContent = '🔌 Connect';
+    btn.disabled    = false;
+    err.textContent = '❌ Network error: ' + e.message;
     err.classList.remove('hidden');
   }
 }
