@@ -117,8 +117,13 @@ async def get_client() -> TelegramClient:
     global _client
     if _client and _client.is_connected():
         return _client
-    _client = TelegramClient(StringSession(), API_ID, API_HASH, **CLIENT_KWARGS)
+    ss = session.get("session_string", "")
+    if not ss:
+        raise Exception("No session string — please login")
+    _client = TelegramClient(StringSession(ss), API_ID, API_HASH, **CLIENT_KWARGS)
     await _client.connect()
+    if not await _client.is_user_authorized():
+        raise Exception("Session string is invalid or expired")
     return _client
 
 async def resolve_entity(client, identifier):
@@ -451,47 +456,25 @@ async def forward_job_async(job_key: str, cfg: dict):
         _running_jobs.pop(job_key, None)
 
 # ── Auth routes ────────────────────────────────────────────
-@app.route("/send_code", methods=["POST"])
-def send_code_route():
-    phone = request.json.get("phone")
-    log.info(f"send_code called for {phone}")
+@app.route("/login", methods=["POST"])
+def login():
+    ss = request.json.get("session_string", "").strip()
+    if not ss:
+        return jsonify(ok=False, error="Session string is empty")
 
-    async def _send():
-        c = await get_client()
-        r = await c.send_code_request(phone)
-        return r.phone_code_hash
-
-    try:
-        h = run_in_loop(_send(), timeout=30)
-        session["phone"] = phone
-        session["hash"]  = h
-        return jsonify(ok=True)
-    except Exception as e:
-        log.error(f"send_code error: {e}")
-        return jsonify(ok=False, error=str(e))
-
-@app.route("/sign_in", methods=["POST"])
-def sign_in_route():
-    code = request.json.get("code")
-    pw   = request.json.get("password", "")
-
-    async def _sign():
-        c = await get_client()
-        try:
-            await c.sign_in(
-                session["phone"], code,
-                phone_code_hash=session["hash"]
-            )
-        except Exception as e:
-            if "two" in str(e).lower() or "password" in str(e).lower():
-                if pw:
-                    await c.sign_in(password=pw)
-                else:
-                    raise Exception("2FA_REQUIRED")
+    async def _check(ss):
+        global _client
+        _client = TelegramClient(StringSession(ss), API_ID, API_HASH, **CLIENT_KWARGS)
+        await _client.connect()
+        if not await _client.is_user_authorized():
+            await _client.disconnect()
+            _client = None
+            raise Exception("Session string is invalid or expired")
         return True
 
     try:
-        run_in_loop(_sign())
+        run_in_loop(_check(ss), timeout=20)
+        session["session_string"] = ss
         session["auth"] = True
         return jsonify(ok=True)
     except Exception as e:
@@ -499,22 +482,15 @@ def sign_in_route():
 
 @app.route("/check_auth")
 def check_auth():
-    async def _check():
-        c = await get_client()
-        return await c.is_user_authorized()
-    try:
-        ok = run_in_loop(_check(), timeout=15)
-        return jsonify(authed=bool(ok))
-    except Exception as e:
-        return jsonify(authed=False, error=str(e))
+    if not session.get("auth") or not session.get("session_string"):
+        return jsonify(authed=False)
+    return jsonify(authed=True)
 
 # ── Dialogs ────────────────────────────────────────────────
 @app.route("/dialogs")
 def get_dialogs():
     async def _get():
         c = await get_client()
-        if not await c.is_user_authorized():
-            raise Exception("Not authorized")
         dialogs = await c.get_dialogs(limit=200)
         result  = []
         for d in dialogs:
@@ -735,7 +711,8 @@ body { font-family: 'Segoe UI', sans-serif; background: #0f0f1a; color: #e0e0e0;
 h1 { text-align: center; color: #7c83fd; margin-bottom: 24px; font-size: 1.8rem; }
 .card { background: #1a1a2e; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #2a2a4a; }
 .card h2 { color: #7c83fd; margin-bottom: 16px; font-size: 1.1rem; }
-input, select { width: 100%; padding: 10px 14px; background: #0f0f1a; border: 1px solid #3a3a5a; border-radius: 8px; color: #e0e0e0; margin-bottom: 12px; font-size: 0.95rem; }
+input, select, textarea { width: 100%; padding: 10px 14px; background: #0f0f1a; border: 1px solid #3a3a5a; border-radius: 8px; color: #e0e0e0; margin-bottom: 12px; font-size: 0.95rem; }
+textarea { resize: vertical; min-height: 80px; font-family: monospace; font-size: 0.82rem; }
 button { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 0.9rem; font-weight: 600; transition: 0.2s; }
 .btn-primary  { background: #7c83fd; color: #fff; }
 .btn-primary:hover { background: #5c63dd; }
@@ -770,6 +747,7 @@ button { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; 
 .source-tag { display: inline-block; background: #2a2a4a; border-radius: 6px; padding: 3px 8px; font-size: 0.82rem; margin: 2px; }
 .multi-source-list { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; min-height: 36px; border: 1px dashed #3a3a5a; border-radius: 8px; padding: 6px; }
 select[multiple] { height: 140px; }
+.hint { font-size: 0.78rem; color: #666; margin-bottom: 10px; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -777,16 +755,17 @@ select[multiple] { height: 140px; }
   <h1>🚀 TG Forwarder Pro</h1>
 
   <div class="card" id="auth-card">
-    <h2>🔐 Login to Telegram</h2>
-    <div id="auth-section">
-      <input type="tel" id="phone" placeholder="Phone number (+91...)" />
-      <button class="btn-primary btn-full" onclick="sendCode()">📲 Send Code</button>
-      <div id="code-section" class="hidden">
-        <input type="text"     id="code"  placeholder="Enter OTP code" />
-        <input type="password" id="twofa" placeholder="2FA Password (if enabled)" />
-        <button class="btn-primary btn-full" onclick="signIn()">✅ Verify & Login</button>
-      </div>
-    </div>
+    <h2>🔐 Login with Session String</h2>
+    <p class="hint">
+      Get your session string from
+      <a href="https://t.me/StringSessionBot" target="_blank" style="color:#7c83fd;">@StringSessionBot</a>
+      on Telegram, or generate one locally with Telethon.<br>
+      Paste it below and click Connect.
+    </p>
+    <textarea id="session-input" placeholder="Paste your Telethon session string here..."></textarea>
+    <button class="btn-primary btn-full" onclick="doLogin()">🔌 Connect</button>
+    <div id="auth-error" class="hidden"
+         style="color:#e74c3c;font-size:0.9rem;margin-top:8px;"></div>
     <div id="auth-info" class="hidden"
          style="color:#27ae60;font-size:0.9rem;margin-top:8px;"></div>
   </div>
@@ -886,42 +865,38 @@ async function api(url, method = 'GET', body = null) {
   return r.json();
 }
 
-async function sendCode() {
-  const phone = document.getElementById('phone').value.trim();
-  if (!phone) return alert('Enter phone number');
-  const btn = event.target;
-  btn.textContent = 'Sending...';
-  btn.disabled = true;
-  const r = await api('/send_code', 'POST', { phone });
-  btn.textContent = '📲 Send Code';
-  btn.disabled = false;
-  if (r.ok) {
-    document.getElementById('code-section').classList.remove('hidden');
-    alert('OTP sent to Telegram');
-  } else {
-    alert('Error: ' + r.error);
-  }
-}
+async function doLogin() {
+  const ss  = document.getElementById('session-input').value.trim();
+  const btn = document.querySelector('#auth-card button');
+  const err = document.getElementById('auth-error');
+  const inf = document.getElementById('auth-info');
 
-async function signIn() {
-  const code     = document.getElementById('code').value.trim();
-  const password = document.getElementById('twofa').value.trim();
-  const btn = event.target;
-  btn.textContent = 'Verifying...';
-  btn.disabled = true;
-  const r = await api('/sign_in', 'POST', { code, password });
-  btn.textContent = '✅ Verify & Login';
-  btn.disabled = false;
+  if (!ss) {
+    err.textContent = '⚠️ Please paste your session string first.';
+    err.classList.remove('hidden');
+    return;
+  }
+
+  btn.textContent = 'Connecting...';
+  btn.disabled    = true;
+  err.classList.add('hidden');
+
+  const r = await api('/login', 'POST', { session_string: ss });
+
+  btn.textContent = '🔌 Connect';
+  btn.disabled    = false;
+
   if (r.ok) {
-    document.getElementById('auth-card').style.borderColor = '#27ae60';
-    document.getElementById('auth-info').textContent = '✅ Logged in successfully!';
-    document.getElementById('auth-info').classList.remove('hidden');
-    document.getElementById('auth-section').classList.add('hidden');
+    inf.textContent = '✅ Connected successfully!';
+    inf.classList.remove('hidden');
+    document.getElementById('session-input').value = '';
     document.getElementById('forward-card').classList.remove('hidden');
+    document.getElementById('auth-card').style.borderColor = '#27ae60';
     loadDialogs();
     loadHistory();
   } else {
-    alert('Login failed: ' + r.error);
+    err.textContent = '❌ ' + r.error;
+    err.classList.remove('hidden');
   }
 }
 
