@@ -15,8 +15,8 @@ nest_asyncio.apply()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-API_ID    = int(os.environ.get("API_ID", "0"))
-API_HASH  = os.environ.get("API_HASH", "")
+API_ID     = int(os.environ.get("API_ID", "0"))
+API_HASH   = os.environ.get("API_HASH", "")
 SECRET_KEY = os.environ.get("SECRET_KEY", "changeme")
 
 CLIENT_KWARGS = dict(
@@ -33,6 +33,7 @@ app.secret_key = SECRET_KEY
 DB_PATH          = "/tmp/forwarder.db"
 _loop            = asyncio.new_event_loop()
 _client          = None
+_session_string  = ""          # global — accessible from all threads
 _live_handlers   = {}
 _running_jobs    = {}
 PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "4"))
@@ -114,15 +115,17 @@ def start_loop():
 threading.Thread(target=start_loop, daemon=True).start()
 
 async def get_client() -> TelegramClient:
-    global _client
+    global _client, _session_string
     if _client and _client.is_connected():
         return _client
-    ss = session.get("session_string", "")
-    if not ss:
-        raise Exception("No session string — please login")
-    _client = TelegramClient(StringSession(ss), API_ID, API_HASH, **CLIENT_KWARGS)
+    if not _session_string:
+        raise Exception("Not logged in — please connect with session string")
+    _client = TelegramClient(
+        StringSession(_session_string), API_ID, API_HASH, **CLIENT_KWARGS
+    )
     await _client.connect()
     if not await _client.is_user_authorized():
+        _client = None
         raise Exception("Session string is invalid or expired")
     return _client
 
@@ -458,33 +461,49 @@ async def forward_job_async(job_key: str, cfg: dict):
 # ── Auth routes ────────────────────────────────────────────
 @app.route("/login", methods=["POST"])
 def login():
-    ss = request.json.get("session_string", "").strip()
+    global _client, _session_string
+    data = request.get_json(force=True, silent=True) or {}
+    ss   = data.get("session_string", "").strip()
+    log.info(f"Login attempt, session string length: {len(ss)}")
+
     if not ss:
         return jsonify(ok=False, error="Session string is empty")
 
-    async def _check(ss):
+    if not API_ID or not API_HASH:
+        return jsonify(ok=False, error="API_ID or API_HASH missing in Railway variables")
+
+    async def _check():
         global _client
-        _client = TelegramClient(StringSession(ss), API_ID, API_HASH, **CLIENT_KWARGS)
-        await _client.connect()
-        if not await _client.is_user_authorized():
-            await _client.disconnect()
-            _client = None
-            raise Exception("Session string is invalid or expired")
-        return True
+        try:
+            c = TelegramClient(
+                StringSession(ss), API_ID, API_HASH, **CLIENT_KWARGS
+            )
+            await c.connect()
+            ok = await c.is_user_authorized()
+            if ok:
+                _client = c
+            else:
+                await c.disconnect()
+            return ok
+        except Exception as e:
+            log.error(f"Login check error: {e}")
+            raise
 
     try:
-        run_in_loop(_check(ss), timeout=20)
-        session["session_string"] = ss
-        session["auth"] = True
-        return jsonify(ok=True)
+        ok = run_in_loop(_check(), timeout=25)
+        if ok:
+            _session_string = ss
+            log.info("Login successful")
+            return jsonify(ok=True)
+        else:
+            return jsonify(ok=False, error="Session string is invalid or expired")
     except Exception as e:
+        log.error(f"Login error: {e}")
         return jsonify(ok=False, error=str(e))
 
 @app.route("/check_auth")
 def check_auth():
-    if not session.get("auth") or not session.get("session_string"):
-        return jsonify(authed=False)
-    return jsonify(authed=True)
+    return jsonify(authed=bool(_session_string and _client))
 
 # ── Dialogs ────────────────────────────────────────────────
 @app.route("/dialogs")
@@ -697,8 +716,7 @@ def scan_duplicates():
 def index():
     return render_template_string(HTML)
 
-HTML = """
-<!DOCTYPE html>
+HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -712,17 +730,17 @@ h1 { text-align: center; color: #7c83fd; margin-bottom: 24px; font-size: 1.8rem;
 .card { background: #1a1a2e; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #2a2a4a; }
 .card h2 { color: #7c83fd; margin-bottom: 16px; font-size: 1.1rem; }
 input, select, textarea { width: 100%; padding: 10px 14px; background: #0f0f1a; border: 1px solid #3a3a5a; border-radius: 8px; color: #e0e0e0; margin-bottom: 12px; font-size: 0.95rem; }
-textarea { resize: vertical; min-height: 80px; font-family: monospace; font-size: 0.82rem; }
+textarea { resize: vertical; min-height: 90px; font-family: monospace; font-size: 0.82rem; }
 button { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; font-size: 0.9rem; font-weight: 600; transition: 0.2s; }
-.btn-primary  { background: #7c83fd; color: #fff; }
+.btn-primary { background: #7c83fd; color: #fff; }
 .btn-primary:hover { background: #5c63dd; }
-.btn-danger   { background: #e74c3c; color: #fff; }
-.btn-warn     { background: #e67e22; color: #fff; }
-.btn-live     { background: #c0392b; color: #fff; }
-.btn-green    { background: #27ae60; color: #fff; }
-.btn-full     { width: 100%; margin-top: 6px; }
-.btn-sm       { padding: 6px 14px; font-size: 0.83rem; }
-.btn-group    { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.btn-danger  { background: #e74c3c; color: #fff; }
+.btn-warn    { background: #e67e22; color: #fff; }
+.btn-live    { background: #c0392b; color: #fff; }
+.btn-green   { background: #27ae60; color: #fff; }
+.btn-full    { width: 100%; margin-top: 6px; }
+.btn-sm      { padding: 6px 14px; font-size: 0.83rem; }
+.btn-group   { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .status { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
 .status.running   { background: #27ae60; color: #fff; }
 .status.done      { background: #2980b9; color: #fff; }
@@ -736,18 +754,18 @@ button { padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; 
 .stat { background: #0f0f1a; border-radius: 8px; padding: 10px; text-align: center; border: 1px solid #2a2a4a; }
 .stat .num { font-size: 1.4rem; font-weight: 700; color: #7c83fd; }
 .stat .lbl { font-size: 0.75rem; color: #888; }
-.dupe-list  { max-height: 150px; overflow-y: auto; font-size: 0.82rem; }
-.dupe-item  { padding: 6px; border-bottom: 1px solid #2a2a4a; display: flex; justify-content: space-between; }
-.hidden     { display: none; }
-.badge      { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
-.badge.green { background: #27ae60; color: #fff; }
-.badge.red   { background: #e74c3c; color: #fff; }
-.job-row    { padding: 10px; border-bottom: 1px solid #2a2a4a; display: flex; justify-content: space-between; align-items: center; cursor: pointer; border-radius: 8px; }
+.dupe-list { max-height: 150px; overflow-y: auto; font-size: 0.82rem; }
+.dupe-item { padding: 6px; border-bottom: 1px solid #2a2a4a; display: flex; justify-content: space-between; }
+.hidden    { display: none; }
+.job-row   { padding: 10px; border-bottom: 1px solid #2a2a4a; display: flex; justify-content: space-between; align-items: center; cursor: pointer; border-radius: 8px; }
 .job-row:hover { background: #0f0f1a; }
 .source-tag { display: inline-block; background: #2a2a4a; border-radius: 6px; padding: 3px 8px; font-size: 0.82rem; margin: 2px; }
 .multi-source-list { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; min-height: 36px; border: 1px dashed #3a3a5a; border-radius: 8px; padding: 6px; }
 select[multiple] { height: 140px; }
-.hint { font-size: 0.78rem; color: #666; margin-bottom: 10px; line-height: 1.5; }
+.msg { padding: 10px 14px; border-radius: 8px; margin-bottom: 10px; font-size: 0.9rem; }
+.msg.error   { background: #3a1a1a; border: 1px solid #e74c3c; color: #e74c3c; }
+.msg.success { background: #1a3a1a; border: 1px solid #27ae60; color: #27ae60; }
+.hint { font-size: 0.78rem; color: #888; margin-bottom: 12px; line-height: 1.6; }
 </style>
 </head>
 <body>
@@ -755,19 +773,15 @@ select[multiple] { height: 140px; }
   <h1>🚀 TG Forwarder Pro</h1>
 
   <div class="card" id="auth-card">
-    <h2>🔐 Login with Session String</h2>
+    <h2>🔐 Connect with Session String</h2>
     <p class="hint">
-      Get your session string from
-      <a href="https://t.me/StringSessionBot" target="_blank" style="color:#7c83fd;">@StringSessionBot</a>
-      on Telegram, or generate one locally with Telethon.<br>
-      Paste it below and click Connect.
+      Get a free session string from <a href="https://t.me/StringSessionBot" target="_blank" style="color:#7c83fd;">@StringSessionBot</a> on Telegram.<br>
+      Start that bot, send your phone number, enter the OTP it asks for, and it gives you a session string.<br>
+      Paste that string below and click Connect.
     </p>
-    <textarea id="session-input" placeholder="Paste your Telethon session string here..."></textarea>
-    <button class="btn-primary btn-full" id="connect-btn" onclick="doLogin(event)">🔌 Connect</button>
-    <div id="auth-error" class="hidden"
-         style="color:#e74c3c;font-size:0.9rem;margin-top:8px;"></div>
-    <div id="auth-info" class="hidden"
-         style="color:#27ae60;font-size:0.9rem;margin-top:8px;"></div>
+    <textarea id="ss-input" placeholder="Paste session string here..."></textarea>
+    <button class="btn-primary btn-full" id="connect-btn">🔌 Connect</button>
+    <div id="auth-msg" class="hidden msg"></div>
   </div>
 
   <div class="card hidden" id="forward-card">
@@ -799,10 +813,10 @@ select[multiple] { height: 140px; }
     <input type="number" id="pin-every" value="200" min="1" placeholder="Pin every N messages" />
     <small style="color:#888;display:block;margin-bottom:14px;">Auto-pin every N forwarded messages</small>
     <div class="btn-group">
-      <button class="btn-warn btn-sm"    onclick="scanDuplicates()">🔍 Scan Dupes</button>
-      <button class="btn-primary btn-sm" onclick="startJob()">▶️ Start</button>
-      <button class="btn-green btn-sm"   onclick="startMultiJob()">⚡ Multi-Source</button>
-      <button class="btn-live btn-sm"    onclick="showLive()">🔴 Live Sync</button>
+      <button class="btn-warn btn-sm"    id="scan-btn">🔍 Scan Dupes</button>
+      <button class="btn-primary btn-sm" id="start-btn">▶️ Start</button>
+      <button class="btn-green btn-sm"   id="multi-btn">⚡ Multi-Source</button>
+      <button class="btn-live btn-sm"    id="live-btn">🔴 Live Sync</button>
     </div>
   </div>
 
@@ -817,7 +831,7 @@ select[multiple] { height: 140px; }
     </div>
     <div class="log-box" id="log-box">Waiting for logs...</div>
     <div class="btn-group" style="margin-top:10px;">
-      <button class="btn-danger btn-sm" onclick="cancelJob()">⏹ Cancel Job</button>
+      <button class="btn-danger btn-sm" id="cancel-btn">⏹ Cancel Job</button>
     </div>
   </div>
 
@@ -830,9 +844,7 @@ select[multiple] { height: 140px; }
     <h2>⚠️ Duplicate Report</h2>
     <div id="dupe-summary" style="margin-bottom:10px;font-size:0.9rem;"></div>
     <div class="dupe-list" id="dupe-list"></div>
-    <button class="btn-primary btn-full" style="margin-top:12px;" onclick="startJob()">
-      ▶️ Continue (Skip Duplicates)
-    </button>
+    <button class="btn-primary btn-full" id="continue-btn" style="margin-top:12px;">▶️ Continue (Skip Duplicates)</button>
   </div>
 
   <div class="card hidden" id="history-card">
@@ -842,12 +854,10 @@ select[multiple] { height: 140px; }
 
   <div class="card hidden" id="live-card">
     <h2>🔴 Live Sync Mode</h2>
-    <p style="font-size:0.85rem;color:#aaa;margin-bottom:14px;">
-      Forwards every new message instantly as it arrives.
-    </p>
+    <p style="font-size:0.85rem;color:#aaa;margin-bottom:14px;">Forwards every new message instantly as it arrives.</p>
     <div id="live-status-box" style="margin-bottom:12px;font-size:0.9rem;color:#27ae60;"></div>
-    <button class="btn-live btn-full" style="margin-bottom:8px;" onclick="startLive()">🔴 Start Live Sync</button>
-    <button class="btn-full" style="background:#7f8c8d;color:#fff;" onclick="stopLive()">⏹ Stop Live Sync</button>
+    <button class="btn-live btn-full" id="start-live-btn" style="margin-bottom:8px;">🔴 Start Live Sync</button>
+    <button class="btn-full" id="stop-live-btn" style="background:#7f8c8d;color:#fff;">⏹ Stop Live Sync</button>
   </div>
 </div>
 
@@ -858,117 +868,114 @@ let multiPollInterval = null;
 let currentLiveSrcId  = null;
 let activeMultiJobs   = [];
 
-async function api(url, method = 'GET', body = null) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+// ── API helper ─────────────────────────────────────────────
+async function api(url, method, body) {
+  method = method || 'GET';
+  var opts = { method: method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(url, opts);
+  var r = await fetch(url, opts);
   return r.json();
 }
 
-async function doLogin(event) {
-  if (event) event.preventDefault();
-  const ssEl = document.getElementById('session-input');
-  const ss   = ssEl ? ssEl.value.trim() : '';
-  const btn  = document.getElementById('connect-btn');
-  const err  = document.getElementById('auth-error');
-  const inf  = document.getElementById('auth-info');
+function showMsg(text, type) {
+  var el = document.getElementById('auth-msg');
+  el.textContent = text;
+  el.className = 'msg ' + type;
+  el.classList.remove('hidden');
+}
+
+// ── Connect ────────────────────────────────────────────────
+document.getElementById('connect-btn').addEventListener('click', function() {
+  var ss  = document.getElementById('ss-input').value.trim();
+  var btn = document.getElementById('connect-btn');
 
   if (!ss) {
-    err.textContent = '⚠️ Please paste your session string first.';
-    err.classList.remove('hidden');
+    showMsg('⚠️ Paste your session string first.', 'error');
     return;
   }
 
   btn.textContent = 'Connecting...';
   btn.disabled    = true;
-  err.classList.add('hidden');
 
-  try {
-    const r = await api('/login', 'POST', { session_string: ss });
+  api('/login', 'POST', { session_string: ss }).then(function(r) {
     btn.textContent = '🔌 Connect';
     btn.disabled    = false;
-
     if (r.ok) {
-      inf.textContent = '✅ Connected successfully!';
-      inf.classList.remove('hidden');
-      ssEl.value = '';
+      showMsg('✅ Connected!', 'success');
+      document.getElementById('ss-input').value = '';
       document.getElementById('forward-card').classList.remove('hidden');
       document.getElementById('auth-card').style.borderColor = '#27ae60';
       loadDialogs();
       loadHistory();
     } else {
-      err.textContent = '❌ ' + r.error;
-      err.classList.remove('hidden');
+      showMsg('❌ ' + (r.error || 'Unknown error'), 'error');
     }
-  } catch (e) {
+  }).catch(function(e) {
     btn.textContent = '🔌 Connect';
     btn.disabled    = false;
-    err.textContent = '❌ Network error: ' + e.message;
-    err.classList.remove('hidden');
-  }
-}
-
-async function loadDialogs() {
-  const r = await api('/dialogs');
-  if (r.error) {
-    alert('Could not load dialogs: ' + r.error);
-    return;
-  }
-  const srcSel = document.getElementById('source-select');
-  const dstSel = document.getElementById('dest-select');
-  srcSel.innerHTML = '';
-  dstSel.innerHTML = '<option value="">-- Select destination --</option>';
-  r.dialogs.forEach(d => {
-    srcSel.add(new Option(`${d.name} (${d.type})`, d.id));
-    dstSel.add(new Option(`${d.name} (${d.type})`, d.id));
+    showMsg('❌ Network error: ' + e.message, 'error');
   });
-  srcSel.addEventListener('change', updateSelectedDisplay);
+});
+
+// ── Dialogs ────────────────────────────────────────────────
+function loadDialogs() {
+  api('/dialogs').then(function(r) {
+    if (r.error) { alert('Dialogs error: ' + r.error); return; }
+    var srcSel = document.getElementById('source-select');
+    var dstSel = document.getElementById('dest-select');
+    srcSel.innerHTML = '';
+    dstSel.innerHTML = '<option value="">-- Select destination --</option>';
+    r.dialogs.forEach(function(d) {
+      var o1 = new Option(d.name + ' (' + d.type + ')', d.id);
+      var o2 = new Option(d.name + ' (' + d.type + ')', d.id);
+      srcSel.add(o1);
+      dstSel.add(o2);
+    });
+    srcSel.addEventListener('change', updateSelectedDisplay);
+  });
 }
 
 function updateSelectedDisplay() {
-  const sel      = document.getElementById('source-select');
-  const display  = document.getElementById('selected-sources-display');
-  const selected = Array.from(sel.selectedOptions);
+  var sel      = document.getElementById('source-select');
+  var display  = document.getElementById('selected-sources-display');
+  var selected = Array.from(sel.selectedOptions);
   if (selected.length === 0) {
     display.innerHTML = '<span style="color:#555;font-size:0.82rem;">Selected sources appear here</span>';
     return;
   }
-  display.innerHTML = selected.map(o =>
-    `<span class="source-tag">${o.text}</span>`
-  ).join('');
+  display.innerHTML = selected.map(function(o) {
+    return '<span class="source-tag">' + o.text + '</span>';
+  }).join('');
 }
 
-async function loadHistory() {
-  const r = await api('/all_jobs');
-  if (!r.jobs || r.jobs.length === 0) return;
-  const running = r.jobs.find(j => j.status === 'running');
-  if (running && !currentJobKey) {
-    currentJobKey = running.job_key;
-    showJobBanner(running);
-    startPolling();
-  }
-  const card = document.getElementById('history-card');
-  const list = document.getElementById('history-list');
-  card.classList.remove('hidden');
-  list.innerHTML = r.jobs.map(j => `
-    <div class="job-row" onclick="resumeMonitor('${j.job_key}')">
-      <div>
-        <div style="font-size:0.88rem;font-weight:600;">${j.source} → ${j.dest}</div>
-        <div style="font-size:0.76rem;color:#888;">${j.updated_at}</div>
-      </div>
-      <div style="text-align:right;">
-        <span class="status ${j.status}">${j.status}</span>
-        <div style="font-size:0.76rem;color:#aaa;margin-top:4px;">
-          ✅${j.done} ⏭${j.skipped} 🔁${j.dupes} ❌${j.errors}
-        </div>
-      </div>
-    </div>
-  `).join('');
+// ── History ────────────────────────────────────────────────
+function loadHistory() {
+  api('/all_jobs').then(function(r) {
+    if (!r.jobs || r.jobs.length === 0) return;
+    var running = r.jobs.find(function(j) { return j.status === 'running'; });
+    if (running && !currentJobKey) {
+      currentJobKey = running.job_key;
+      showJobBanner(running);
+      startPolling();
+    }
+    document.getElementById('history-card').classList.remove('hidden');
+    document.getElementById('history-list').innerHTML = r.jobs.map(function(j) {
+      return '<div class="job-row" data-key="' + j.job_key + '">' +
+        '<div><div style="font-size:0.88rem;font-weight:600;">' + j.source + ' → ' + j.dest + '</div>' +
+        '<div style="font-size:0.76rem;color:#888;">' + j.updated_at + '</div></div>' +
+        '<div style="text-align:right;"><span class="status ' + j.status + '">' + j.status + '</span>' +
+        '<div style="font-size:0.76rem;color:#aaa;margin-top:4px;">✅' + j.done + ' ⏭' + j.skipped + ' 🔁' + j.dupes + ' ❌' + j.errors + '</div></div>' +
+        '</div>';
+    }).join('');
+    document.querySelectorAll('.job-row').forEach(function(el) {
+      el.addEventListener('click', function() { resumeMonitor(el.dataset.key); });
+    });
+  });
 }
 
 function showJobBanner(j) {
   document.getElementById('active-job-banner').classList.remove('hidden');
-  document.getElementById('banner-info').textContent = `${j.source} → ${j.dest}`;
+  document.getElementById('banner-info').textContent = j.source + ' → ' + j.dest;
 }
 
 function resumeMonitor(job_key) {
@@ -977,8 +984,9 @@ function resumeMonitor(job_key) {
   startPolling();
 }
 
+// ── Media types ────────────────────────────────────────────
 function getMediaTypes() {
-  const t = [];
+  var t = [];
   if (document.getElementById('type-video').checked)    t.push('video');
   if (document.getElementById('type-photo').checked)    t.push('photo');
   if (document.getElementById('type-document').checked) t.push('document');
@@ -998,161 +1006,166 @@ function getJobConfig() {
   };
 }
 
-async function scanDuplicates() {
-  const sel    = document.getElementById('source-select');
-  const source = sel.selectedOptions[0]?.value;
-  const limit  = document.getElementById('limit').value;
-  const types  = getMediaTypes().filter(t => t !== 'text');
-  if (!source) return alert('Select a source channel');
-  const r = await api('/scan_duplicates', 'POST', { source, limit, media_types: types });
-  const card    = document.getElementById('dupe-card');
-  const summary = document.getElementById('dupe-summary');
-  const list    = document.getElementById('dupe-list');
-  card.classList.remove('hidden');
-  if (r.ok) {
-    summary.textContent = `Found ${r.count} duplicate file(s).`;
-    list.innerHTML = r.duplicates.map(d =>
-      `<div class="dupe-item">
-        <span>Msg #${d.msg_id} (${d.type})</span>
-        <span>Dup of #${d.duplicate_of} | ${(d.size/1024/1024).toFixed(1)} MB</span>
-      </div>`
-    ).join('') || '<div style="color:#888;padding:8px;">No duplicates ✅</div>';
-  } else {
-    summary.textContent = 'Scan failed: ' + r.error;
-  }
-}
+// ── Buttons ────────────────────────────────────────────────
+document.getElementById('scan-btn').addEventListener('click', function() {
+  var sel    = document.getElementById('source-select');
+  var source = sel.selectedOptions[0] ? sel.selectedOptions[0].value : '';
+  var limit  = document.getElementById('limit').value;
+  var types  = getMediaTypes().filter(function(t) { return t !== 'text'; });
+  if (!source) { alert('Select a source channel'); return; }
+  api('/scan_duplicates', 'POST', { source: source, limit: limit, media_types: types }).then(function(r) {
+    document.getElementById('dupe-card').classList.remove('hidden');
+    if (r.ok) {
+      document.getElementById('dupe-summary').textContent = 'Found ' + r.count + ' duplicate file(s).';
+      document.getElementById('dupe-list').innerHTML = r.duplicates.length ?
+        r.duplicates.map(function(d) {
+          return '<div class="dupe-item"><span>Msg #' + d.msg_id + ' (' + d.type + ')</span>' +
+            '<span>Dup of #' + d.duplicate_of + ' | ' + (d.size/1024/1024).toFixed(1) + ' MB</span></div>';
+        }).join('') : '<div style="color:#888;padding:8px;">No duplicates ✅</div>';
+    } else {
+      document.getElementById('dupe-summary').textContent = 'Scan failed: ' + r.error;
+    }
+  });
+});
 
-async function startJob() {
-  const sel    = document.getElementById('source-select');
-  const source = sel.selectedOptions[0]?.value;
-  const cfg    = getJobConfig();
-  if (!source || !cfg.dest) return alert('Select source and destination');
-  if (cfg.media_types.length === 0) return alert('Select at least one content type');
-  const r = await api('/start_job', 'POST', { ...cfg, source });
-  if (r.ok) {
-    currentJobKey = r.job_key;
-    showJobBanner({ source, dest: cfg.dest });
-    document.getElementById('dupe-card').classList.add('hidden');
-    startPolling();
+document.getElementById('start-btn').addEventListener('click', function() {
+  var sel    = document.getElementById('source-select');
+  var source = sel.selectedOptions[0] ? sel.selectedOptions[0].value : '';
+  var cfg    = getJobConfig();
+  if (!source || !cfg.dest) { alert('Select source and destination'); return; }
+  if (cfg.media_types.length === 0) { alert('Select at least one content type'); return; }
+  cfg.source = source;
+  api('/start_job', 'POST', cfg).then(function(r) {
+    if (r.ok) {
+      currentJobKey = r.job_key;
+      showJobBanner({ source: source, dest: cfg.dest });
+      document.getElementById('dupe-card').classList.add('hidden');
+      startPolling();
+      loadHistory();
+    } else {
+      alert('Failed to start job');
+    }
+  });
+});
+
+document.getElementById('continue-btn').addEventListener('click', function() {
+  document.getElementById('start-btn').click();
+});
+
+document.getElementById('multi-btn').addEventListener('click', function() {
+  var sel     = document.getElementById('source-select');
+  var sources = Array.from(sel.selectedOptions).map(function(o) { return o.value; });
+  var cfg     = getJobConfig();
+  if (sources.length === 0) { alert('Select at least one source channel'); return; }
+  if (!cfg.dest) { alert('Select a destination channel'); return; }
+  if (sources.length === 1) { document.getElementById('start-btn').click(); return; }
+  cfg.sources = sources;
+  api('/start_multi_job', 'POST', cfg).then(function(r) {
+    if (r.ok) {
+      activeMultiJobs = r.jobs.map(function(j) { return j.job_key; });
+      document.getElementById('multi-monitor-card').classList.remove('hidden');
+      startMultiPolling();
+      loadHistory();
+      alert('⚡ Started ' + r.jobs.length + ' parallel jobs!');
+    } else {
+      alert('Failed: ' + r.error);
+    }
+  });
+});
+
+document.getElementById('cancel-btn').addEventListener('click', function() {
+  if (!currentJobKey) return;
+  if (!confirm('Cancel this job?')) return;
+  api('/cancel_job/' + currentJobKey, 'POST').then(function() {
+    document.getElementById('banner-status').textContent = 'cancelled';
+    document.getElementById('banner-status').className   = 'status cancelled';
+    clearInterval(pollInterval);
     loadHistory();
-  } else {
-    alert('Failed to start job');
-  }
-}
+  });
+});
 
-async function startMultiJob() {
-  const sel     = document.getElementById('source-select');
-  const sources = Array.from(sel.selectedOptions).map(o => o.value);
-  const cfg     = getJobConfig();
-  if (sources.length === 0) return alert('Select at least one source channel');
-  if (!cfg.dest) return alert('Select a destination channel');
-  if (sources.length === 1) return startJob();
-  const r = await api('/start_multi_job', 'POST', { ...cfg, sources });
-  if (r.ok) {
-    activeMultiJobs = r.jobs.map(j => j.job_key);
-    document.getElementById('multi-monitor-card').classList.remove('hidden');
-    startMultiPolling();
-    loadHistory();
-    alert(`⚡ Started ${r.jobs.length} parallel jobs!`);
-  } else {
-    alert('Failed: ' + r.error);
-  }
-}
+document.getElementById('live-btn').addEventListener('click', function() {
+  document.getElementById('live-card').classList.remove('hidden');
+});
 
+document.getElementById('start-live-btn').addEventListener('click', function() {
+  var sel    = document.getElementById('source-select');
+  var source = sel.selectedOptions[0] ? sel.selectedOptions[0].value : '';
+  var dest   = document.getElementById('dest-select').value;
+  var types  = getMediaTypes();
+  if (!source || !dest) { alert('Select source and destination first'); return; }
+  api('/start_live', 'POST', { source: source, dest: dest, media_types: types }).then(function(r) {
+    if (r.ok) {
+      currentLiveSrcId = r.src_id;
+      document.getElementById('live-status-box').innerHTML = '✅ Live sync active<br><small>' + source + ' → ' + dest + '</small>';
+    } else {
+      alert('Failed: ' + r.error);
+    }
+  });
+});
+
+document.getElementById('stop-live-btn').addEventListener('click', function() {
+  if (!currentLiveSrcId) { alert('No active live sync'); return; }
+  api('/stop_live', 'POST', { src_id: currentLiveSrcId }).then(function(r) {
+    if (r.ok) {
+      currentLiveSrcId = null;
+      document.getElementById('live-status-box').textContent = '⏹ Stopped.';
+    }
+  });
+});
+
+// ── Polling ────────────────────────────────────────────────
 function startPolling() {
   if (pollInterval) clearInterval(pollInterval);
-  pollInterval = setInterval(async () => {
+  pollInterval = setInterval(function() {
     if (!currentJobKey) return;
-    const j = await api(`/job_status/${currentJobKey}`);
-    if (j.error) return;
-    document.getElementById('stat-done').textContent    = j.done    || 0;
-    document.getElementById('stat-skipped').textContent = j.skipped || 0;
-    document.getElementById('stat-dupes').textContent   = j.dupes   || 0;
-    document.getElementById('stat-errors').textContent  = j.errors  || 0;
-    const badge = document.getElementById('banner-status');
-    badge.textContent = j.status;
-    badge.className   = `status ${j.status}`;
-    const lb = document.getElementById('log-box');
-    lb.innerHTML = (j.logs || []).join('\n');
-    lb.scrollTop = lb.scrollHeight;
-    if (['done', 'error', 'cancelled'].includes(j.status)) {
-      clearInterval(pollInterval);
-      loadHistory();
-    }
+    api('/job_status/' + currentJobKey).then(function(j) {
+      if (j.error) return;
+      document.getElementById('stat-done').textContent    = j.done    || 0;
+      document.getElementById('stat-skipped').textContent = j.skipped || 0;
+      document.getElementById('stat-dupes').textContent   = j.dupes   || 0;
+      document.getElementById('stat-errors').textContent  = j.errors  || 0;
+      var badge = document.getElementById('banner-status');
+      badge.textContent = j.status;
+      badge.className   = 'status ' + j.status;
+      var lb = document.getElementById('log-box');
+      lb.textContent = (j.logs || []).join('\n');
+      lb.scrollTop   = lb.scrollHeight;
+      if (j.status === 'done' || j.status === 'error' || j.status === 'cancelled') {
+        clearInterval(pollInterval);
+        loadHistory();
+      }
+    });
   }, 2000);
 }
 
 function startMultiPolling() {
   if (multiPollInterval) clearInterval(multiPollInterval);
-  multiPollInterval = setInterval(async () => {
+  multiPollInterval = setInterval(function() {
     if (activeMultiJobs.length === 0) { clearInterval(multiPollInterval); return; }
-    const statuses = await Promise.all(activeMultiJobs.map(k => api(`/job_status/${k}`)));
-    const container = document.getElementById('multi-job-list');
-    container.innerHTML = statuses.map((j, i) => `
-      <div style="padding:10px;border-bottom:1px solid #2a2a4a;">
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <span style="font-size:0.88rem;font-weight:600;">${j.source || activeMultiJobs[i]}</span>
-          <span class="status ${j.status}">${j.status}</span>
-        </div>
-        <div style="font-size:0.78rem;color:#aaa;margin-top:4px;">
-          ✅ ${j.done||0} forwarded &nbsp; 🔁 ${j.dupes||0} dupes &nbsp; ❌ ${j.errors||0} errors
-        </div>
-        <div style="margin-top:6px;">
-          <button class="btn-danger btn-sm" onclick="cancelSpecific('${activeMultiJobs[i]}')">⏹ Cancel</button>
-        </div>
-      </div>
-    `).join('');
-    const allDone = statuses.every(j => ['done','error','cancelled'].includes(j.status));
-    if (allDone) { clearInterval(multiPollInterval); loadHistory(); }
+    Promise.all(activeMultiJobs.map(function(k) { return api('/job_status/' + k); })).then(function(statuses) {
+      var container = document.getElementById('multi-job-list');
+      container.innerHTML = statuses.map(function(j, i) {
+        return '<div style="padding:10px;border-bottom:1px solid #2a2a4a;">' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;">' +
+          '<span style="font-size:0.88rem;font-weight:600;">' + (j.source || activeMultiJobs[i]) + '</span>' +
+          '<span class="status ' + j.status + '">' + j.status + '</span></div>' +
+          '<div style="font-size:0.78rem;color:#aaa;margin-top:4px;">✅ ' + (j.done||0) + ' &nbsp; 🔁 ' + (j.dupes||0) + ' &nbsp; ❌ ' + (j.errors||0) + '</div>' +
+          '<div style="margin-top:6px;"><button class="btn-danger btn-sm" data-key="' + activeMultiJobs[i] + '">⏹ Cancel</button></div></div>';
+      }).join('');
+      container.querySelectorAll('button[data-key]').forEach(function(btn) {
+        btn.addEventListener('click', function() { api('/cancel_job/' + btn.dataset.key, 'POST'); });
+      });
+      var allDone = statuses.every(function(j) {
+        return j.status === 'done' || j.status === 'error' || j.status === 'cancelled';
+      });
+      if (allDone) { clearInterval(multiPollInterval); loadHistory(); }
+    });
   }, 2000);
-}
-
-async function cancelSpecific(job_key) {
-  await api(`/cancel_job/${job_key}`, 'POST');
-}
-
-async function cancelJob() {
-  if (!currentJobKey) return;
-  if (!confirm('Cancel this job?')) return;
-  await api(`/cancel_job/${currentJobKey}`, 'POST');
-  document.getElementById('banner-status').textContent = 'cancelled';
-  document.getElementById('banner-status').className   = 'status cancelled';
-  clearInterval(pollInterval);
-  loadHistory();
-}
-
-function showLive() {
-  document.getElementById('live-card').classList.remove('hidden');
-}
-
-async function startLive() {
-  const sel    = document.getElementById('source-select');
-  const source = sel.selectedOptions[0]?.value;
-  const dest   = document.getElementById('dest-select').value;
-  const types  = getMediaTypes();
-  if (!source || !dest) return alert('Select source and destination first');
-  const r = await api('/start_live', 'POST', { source, dest, media_types: types });
-  if (r.ok) {
-    currentLiveSrcId = r.src_id;
-    document.getElementById('live-status-box').innerHTML =
-      `✅ Live sync active<br><small>${source} → ${dest}</small>`;
-  } else {
-    alert('Failed: ' + r.error);
-  }
-}
-
-async function stopLive() {
-  if (!currentLiveSrcId) return alert('No active live sync');
-  const r = await api('/stop_live', 'POST', { src_id: currentLiveSrcId });
-  if (r.ok) {
-    currentLiveSrcId = null;
-    document.getElementById('live-status-box').textContent = '⏹ Stopped.';
-  }
 }
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
