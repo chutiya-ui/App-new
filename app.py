@@ -69,6 +69,29 @@ def init_db():
 
 init_db()
 
+import urllib.request
+
+def self_ping():
+    """Ping own URL every 4 minutes to prevent Railway sleep"""
+    app_url = os.environ.get("APP_URL", "")
+    if not app_url:
+        log.warning("APP_URL not set, self-ping disabled")
+        return
+    while True:
+        try:
+            urllib.request.urlopen(f"{app_url}/ping", timeout=10)
+            log.info("Self-ping OK")
+        except Exception as e:
+            log.warning(f"Self-ping failed: {e}")
+        threading.Event().wait(240)  # ping every 4 minutes
+
+@app.route("/ping")
+def ping():
+    return jsonify(status="alive", time=str(datetime.now()))
+
+# Start self-ping thread
+threading.Thread(target=self_ping, daemon=True).start()
+
 # ── Session persistence ────────────────────────────────────
 def save_session_to_db(session_str: str):
     with db() as c:
